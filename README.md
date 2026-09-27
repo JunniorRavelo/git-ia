@@ -1,6 +1,6 @@
 # git-ai
 
-![versión](https://img.shields.io/badge/versión-v2.0.0-blue)
+![versión](https://img.shields.io/badge/versión-v2.1.0-blue)
 ![licencia](https://img.shields.io/badge/licencia-MIT-green)
 ![python](https://img.shields.io/badge/python-3.8+-yellow)
 
@@ -85,7 +85,7 @@ source ~/.bashrc
 | `NVIDIA_BASE_URL`  | URL base de la API.                          | `https://integrate.api.nvidia.com/v1`      |
 | `COMMIT_IA_MODEL`  | Modelo a usar para generar el commit.        | `deepseek-ai/deepseek-v4.1-flash`          |
 | `COMMIT_IA_LANG`   | Idioma del mensaje de commit (código ISO 639-1). | `es`                                   |
-| `GIT_AI_TIMEOUT`   | Límite de tiempo (segundos) para generar el mensaje; al agotarse se cancela con sugerencias. | `60`                                   |
+| `GIT_AI_TIMEOUT`   | Máx. segundos de inactividad; si la IA sigue respondiendo, se espera a que termine. | `60`                                   |
 | `NO_COLOR`         | Si está definida, desactiva los colores.     | —                                          |
 | `GIT_AI_CONFIG_DIR`| Directorio del archivo de config persistente. | `~/.config/git-ai`                         |
 | `GIT_AI_INSTALL_DIR` | Directorio donde `install.sh` crea el enlace `git-ai`. | `~/.local/bin`                  |
@@ -225,7 +225,7 @@ el prompt de confirmación.
 
 ### Fallback automático de modelo
 
-Si el modelo activo falla al generar (404, timeout o error de red), `git ai`
+Si el modelo activo falla al generar (404, inactividad o error de red), `git ai`
 prueba automáticamente el siguiente modelo verificado en la caché y continúa
 sin intervención:
 
@@ -293,10 +293,18 @@ git ai version
 Salida esperada:
 
 ```
-git-ai v2.0.0
+git-ai v2.1.0
 ```
 
 ## Changelog
+
+### v2.1.0
+
+- **feat**: `GIT_AI_TIMEOUT` ahora mide **inactividad**, no tiempo total: mientras el modelo siga emitiendo datos (aunque sea lento o esté razonando), se le espera a que termine sin cortarlo. Solo se corta (y aplica el fallback) si pasa ese tiempo sin recibir nada del modelo; los keep-alives del servidor no cuentan como actividad.
+
+### v2.0.1
+
+- **fix**: los fallos sin código HTTP (timeout, red) ya no muestran el prefijo confuso "HTTP 0"; ahora solo el motivo (ej. `timeout: más de 60 s generando el mensaje`).
 
 ### v2.0.0
 

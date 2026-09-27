@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 import httpx
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 # 0. Archivo de configuración persistente (~/.config/git-ai/config.env)
 #    Se carga antes que nada: las variables de entorno ya definidas tienen prioridad
@@ -104,7 +104,9 @@ _BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
 _MODEL = os.getenv("COMMIT_IA_MODEL", "deepseek-ai/deepseek-v4.1-flash")
 _LANG = os.getenv("COMMIT_IA_LANG", "es")
 
-# Límite de tiempo (segundos) para generar el mensaje; evita esperas infinitas
+# Máximo tiempo (segundos) de INACTIVIDAD del modelo: mientras siga emitiendo
+# datos (aunque sea lenta o esté razonando), se le espera indefinidamente;
+# solo se corta si enmudece más de este tiempo.
 try:
     _TIMEOUT = float(os.getenv("GIT_AI_TIMEOUT", "60"))
     if _TIMEOUT <= 0:
@@ -317,8 +319,8 @@ def cmd_help():
     print("  NVIDIA_API_KEY   (obligatoria) Tu API key de NVIDIA (https://build.nvidia.com).")
     print("  COMMIT_IA_MODEL  Modelo a usar (por defecto: deepseek-ai/deepseek-v4.1-flash).")
     print("  COMMIT_IA_LANG   Idioma del mensaje del commit, código ISO 639-1 (por defecto: es).")
-    print("  GIT_AI_TIMEOUT   Límite de tiempo en segundos para generar el mensaje (60).")
-    print("                   Si se agota, se cancela y sugiere cómo proceder.\n")
+    print("  GIT_AI_TIMEOUT   Máx. segundos de inactividad del modelo (60). Mientras la")
+    print("                   IA siga respondiendo, se espera a que termine sin cortarla.\n")
     print("Tras generar el mensaje: s=confirmar / n=cancelar / e=editar / r=regenerar.")
     sys.exit(0)
 
@@ -390,12 +392,15 @@ class _ErrorModelo(Exception):
     """Fallo invocando un modelo: 404 de cuenta, timeout, red, etc."""
     def __init__(self, modelo: str, codigo: int, detalle: str = ""):
         self.modelo, self.codigo, self.detalle = modelo, codigo, detalle
-        super().__init__(f"HTTP {codigo} {detalle}".strip() if detalle else f"HTTP {codigo}")
+        # codigo 0 = fallo sin HTTP (timeout/red): sin prefijo "HTTP 0"
+        if codigo:
+            super().__init__(f"HTTP {codigo} {detalle}".strip())
+        else:
+            super().__init__(detalle or "fallo desconocido")
 
 def generar_commit(diff_text: str, modelo: str) -> str:
     """Llama a la API (SSE con httpx) y devuelve el mensaje del commit, en streaming."""
     print(f"{_GREEN_COLOR}--- MENSAJE PROPUESTO ---{_RESET_COLOR}")
-    _inicio = time.monotonic()
     payload = {
         "model": modelo,
         "messages": [
@@ -424,13 +429,17 @@ def generar_commit(diff_text: str, modelo: str) -> str:
                     except ValueError:
                         detalle = cuerpo[:200]
                     raise _ErrorModelo(modelo, resp.status_code, detalle)
+                _ultima_actividad = time.monotonic()
                 for line in resp.iter_lines():
-                    if time.monotonic() - _inicio > _TIMEOUT:
+                    _ahora = time.monotonic()
+                    if _ahora - _ultima_actividad > _TIMEOUT:
                         raise _ErrorModelo(
-                            modelo, 0, f"timeout: más de {_TIMEOUT:.0f} s generando el mensaje"
+                            modelo, 0,
+                            f"inactividad: sin datos del modelo por más de {_TIMEOUT:.0f} s",
                         )
                     if not line.startswith("data:"):
-                        continue
+                        continue  # keep-alives (":") y vacíos no cuentan como actividad
+                    _ultima_actividad = _ahora
                     data = line[5:].strip()
                     if data == "[DONE]":
                         break
@@ -446,7 +455,9 @@ def generar_commit(diff_text: str, modelo: str) -> str:
                         print(content, end="", flush=True)
                         commit_message += content
     except httpx.TimeoutException as e:
-        raise _ErrorModelo(modelo, 0, f"timeout: {e.__class__.__name__}") from e
+        raise _ErrorModelo(
+            modelo, 0, f"inactividad: sin datos del modelo ({e.__class__.__name__})"
+        ) from e
     except httpx.RequestError as e:
         raise _ErrorModelo(modelo, 0, f"red: {e}") from e
     print(f"\n{_GREEN_COLOR}------------------------{_RESET_COLOR}\n")
