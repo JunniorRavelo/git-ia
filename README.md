@@ -1,6 +1,6 @@
 # git-ai
 
-![versión](https://img.shields.io/badge/versión-v1.9.0-blue)
+![versión](https://img.shields.io/badge/versión-v2.0.0-blue)
 ![licencia](https://img.shields.io/badge/licencia-MIT-green)
 ![python](https://img.shields.io/badge/python-3.8+-yellow)
 
@@ -9,35 +9,59 @@ Extensión de Git CLI que genera mensajes de commit automáticamente usando IA
 un mensaje siguiendo la convención **Conventional Commits** en español, con
 streaming en tiempo real. Si lo aceptas, hace el commit por ti.
 
+## Características
+
+- Streaming en tiempo real del mensaje mientras se genera.
+- **Fallback automático**: si el modelo falla (404, timeout, red), salta al
+  siguiente verificado y guarda el que funciona como activo.
+- **Detector de secretos** en el diff (claves `nvapi-`/`sk-`, AWS, GitHub,
+  Slack, claves privadas) antes de enviarlo a la nube.
+- **Catálogo de modelos en vivo** con verificación real y lista negra de
+  caídos que nunca se re-testean.
+- Única dependencia: `httpx` (sin SDK de OpenAI). Instalador incluido.
+
 ## ¿Cómo funciona?
 
 1. Haces `git add` de los archivos que quieres commitear (como siempre).
 2. Ejecutas `git ai` (o `git-ai`).
-3. La IA lee el diff en stage y redacta un mensaje profesional.
-4. Eliges qué hacer: confirmar (`s`), cancelar (`n`), editar (`e`) o regenerar (`r`).
+3. Se escanea el diff en busca de secretos antes de enviarlo a la nube.
+4. La IA lee el diff en stage y redacta un mensaje profesional; si el modelo
+   falla o cuelga, git ai salta automáticamente al siguiente verificado.
+5. Eliges qué hacer: confirmar (`s`), cancelar (`n`), editar (`e`) o regenerar (`r`).
 
 ## Requisitos
 
 - Python 3.8+
 - `git`
 - Una API key de NVIDIA (la obtienes en https://build.nvidia.com)
-- La librería `openai` de Python
+- La librería `httpx` de Python (única dependencia; desde v2.0 ya no se usa `openai`)
 
 ## Instalación
 
-### 1. Instalar la librería de Python
+### 1. Instalar todo con el instalador (recomendado)
 
 ```bash
-# Debian/Ubuntu (si pip está bloqueado por PEP 668)
-pip3 install openai --break-system-packages
-
-# O en un entorno virtual (recomendado)
-python3 -m venv .venv
-source .venv/bin/activate
-pip install openai
+bash install.sh
 ```
 
-### 2. Configurar tu API key
+Verifica Python 3.8+, instala `httpx` si falta, crea el enlace `git-ai` en
+`~/.local/bin` (o en el directorio que marques con `GIT_AI_INSTALL_DIR`) y
+comprueba que esté en tu `PATH`.
+
+### 2. Instalación manual
+
+```bash
+# Única dependencia (Debian/Ubuntu con PEP 668 puede necesitar --break-system-packages)
+pip3 install httpx --break-system-packages
+
+chmod +x git-ai.sh
+mkdir -p ~/.local/bin
+ln -sfn "$(pwd)/git-ai.sh" ~/.local/bin/git-ai
+# ¿Prefieres instalación en todo el sistema?
+# sudo ln -sfn "$(pwd)/git-ai.sh" /usr/local/bin/git-ai
+```
+
+### 3. Configurar tu API key
 
 El script requiere que proporciones tu propia API key mediante una variable de
 entorno (no se embebe ninguna key en el código):
@@ -53,31 +77,6 @@ echo 'export NVIDIA_API_KEY="tu-api-key-aqui"' >> ~/.bashrc
 source ~/.bashrc
 ```
 
-### 3. Instalar el comando como subcomando de Git
-
-Git reconoce como subcomandos cualquier ejecutable en el `PATH` cuyo nombre
-empiece por `git-`. Copia (o enlaza) el script con el nombre `git-ai`:
-
-```bash
-chmod +x git-ai.sh
-sudo ln -s "$(pwd)/git-ai.sh" /usr/local/bin/git-ai
-```
-
-Ahora puedes usarlo desde cualquier repositorio:
-
-```bash
-git ai
-```
-
-> Alternativa sin permisos de root: añade el directorio del script a tu `PATH`
-> o crea un enlace dentro de `~/.local/bin`:
->
-> ```bash
-> mkdir -p ~/.local/bin
-> ln -s "$(pwd)/git-ai.sh" ~/.local/bin/git-ai
-> # asegúrate de tener ~/.local/bin en el PATH
-> ```
-
 ## Variables de entorno
 
 | Variable           | Descripción                                  | Por defecto                                |
@@ -89,9 +88,18 @@ git ai
 | `GIT_AI_TIMEOUT`   | Límite de tiempo (segundos) para generar el mensaje; al agotarse se cancela con sugerencias. | `60`                                   |
 | `NO_COLOR`         | Si está definida, desactiva los colores.     | —                                          |
 | `GIT_AI_CONFIG_DIR`| Directorio del archivo de config persistente. | `~/.config/git-ai`                         |
+| `GIT_AI_INSTALL_DIR` | Directorio donde `install.sh` crea el enlace `git-ai`. | `~/.local/bin`                  |
 
 > Orden de prioridad para `COMMIT_IA_MODEL`: variable de entorno (manual) > archivo de
 > config (`~/.config/git-ai/config.env`, escrito por `git ai -c`) > valor por defecto.
+
+### Archivos locales (`~/.config/git-ai/`)
+
+| Archivo           | Uso                                                          |
+|--------------------|--------------------------------------------------------------|
+| `config.env`       | Modelo activo (lo escribe `git ai -c` o el fallback).        |
+| `models-cache.json`| Caché de modelos verificados (dura 7 días).                  |
+| `blacklist.json`   | Modelos caídos: no se re-testean. Bórralo para re-testear.   |
 
 ### Idiomas soportados
 
@@ -215,6 +223,17 @@ feat(auth): agregar validación de token jwt
 Con `-y` el commit se realiza directamente tras generar el mensaje, sin mostrar
 el prompt de confirmación.
 
+### Fallback automático de modelo
+
+Si el modelo activo falla al generar (404, timeout o error de red), `git ai`
+prueba automáticamente el siguiente modelo verificado en la caché y continúa
+sin intervención:
+
+- El modelo que funciona queda guardado como nuevo activo (`config.env`).
+- Los 404 van solos a la lista negra.
+- Si al arrancar el modelo activo ya figura en la lista negra, se avisa antes
+  de intentarlo (se intenta igualmente; el fallback te cubre si falla).
+
 ## Opciones del menú
 
 Tras generar el mensaje, el script te pregunta qué hacer. Puedes combinar
@@ -253,6 +272,10 @@ sin tener que cancelar y volver a ejecutar `git ai`.
 
 - La API key se carga desde la variable de entorno `NVIDIA_API_KEY`.
   **No la hardcodees** en el script ni la commitees.
+- **Detector de secretos**: antes de enviar el diff a la IA se escanea en busca
+  de claves `nvapi-`/`sk-`, AWS `AKIA...`, tokens de GitHub/Slack y claves
+  privadas. Si detecta algo, avisa (sin imprimir el secreto) y pide
+  confirmación; en modo `git ai -y` aborta directamente.
 - Si publicas este proyecto, asegúrate de no incluir tu `.env` ni tu
   `~/.bashrc` con la key real.
 
@@ -270,10 +293,19 @@ git ai version
 Salida esperada:
 
 ```
-git-ai v1.9.0
+git-ai v2.0.0
 ```
 
 ## Changelog
+
+### v2.0.0
+
+- **feat**: **fallback automático de modelo**: si el activo falla al generar (404, timeout o error de red), `git ai` prueba el siguiente modelo verificado en caché y continúa solo; el que funciona se guarda como nuevo activo.
+- **feat**: aviso al arrancar si el modelo activo está en la lista negra (falló antes).
+- **feat**: **detector de secretos** en el diff (`nvapi-`, `sk-`, AWS `AKIA`, tokens de GitHub/Slack, claves privadas): avisa antes de enviar a la nube y aborta en modo `--yes`.
+- **refactor**: se elimina la dependencia de la librería `openai`; el chat se consume directo por `httpx` (SSE). Única dependencia: `httpx`, y el arranque de `git ai` es tan rápido como el de `-c`.
+- **feat**: instalador `install.sh`: dependencias, enlace `git-ai` y verificación en un solo comando.
+- **fix**: los fallos terminan con código de salida distinto de cero (1; 130 al cancelar con Ctrl+C), para que los scripts que usen `git ai -y` detecten el error.
 
 ### v1.9.0
 

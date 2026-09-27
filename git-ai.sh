@@ -2,13 +2,14 @@
 import os
 import sys
 import json
+import re
 import subprocess
 import tempfile
 import time
 from pathlib import Path
 import httpx
 
-__version__ = "1.9.0"
+__version__ = "2.0.0"
 
 # 0. Archivo de configuración persistente (~/.config/git-ai/config.env)
 #    Se carga antes que nada: las variables de entorno ya definidas tienen prioridad
@@ -130,6 +131,45 @@ def _cargar_blacklist() -> set:
 def _guardar_blacklist(blacklist: set) -> None:
     _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     _BLACKLIST_FILE.write_text(json.dumps(sorted(blacklist)), encoding="utf-8")
+
+def _modelos_verificados() -> list:
+    """Modelos verificados por `git ai -c` (caché local, si existe)."""
+    try:
+        data = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
+        return [m for m in data.get("models", []) if isinstance(m, str)]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+# Patrones de secretos de alta confianza: si aparecen en el diff, se avisa
+# antes de enviarlo a la nube (el secreto jamás se imprime por pantalla).
+_SECRET_PATTERNS = [
+    ("API key de NVIDIA (nvapi-)", re.compile(r"nvapi-[A-Za-z0-9_\-]{16,}")),
+    ("API key tipo sk- (OpenAI u otra)", re.compile(r"sk-(?:proj-)?[A-Za-z0-9_\-]{16,}")),
+    ("AWS Access Key ID (AKIA...)", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("Token de GitHub", re.compile(r"\b(?:ghp_|github_pat_)[A-Za-z0-9_\-]{20,}")),
+    ("Token de Slack", re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}\b")),
+    ("Clave privada (BEGIN PRIVATE KEY)", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+]
+
+def _buscar_secretos(diff_text: str) -> list:
+    """Devuelve [(tipo, archivo:línea)] por cada posible secreto añadido en el diff."""
+    hallazgos, archivo, linea = [], "", 0
+    for lin in diff_text.splitlines():
+        if lin.startswith("+++ b/"):
+            archivo = lin[6:]
+            continue
+        m = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)", lin)
+        if m:
+            linea = int(m.group(1)) - 1
+            continue
+        if lin.startswith("+"):
+            linea += 1
+            for tipo, patron in _SECRET_PATTERNS:
+                if patron.search(lin):
+                    hallazgos.append((tipo, f"{archivo}:{linea}"))
+        elif lin.startswith(" "):
+            linea += 1
+    return hallazgos
 
 def cmd_configure():
     """Consulta el catálogo del API, verifica qué modelos responden y permite elegir/guardar el activo."""
@@ -319,24 +359,21 @@ _LANG_NAMES = {
 }
 _LANG_NAME = _LANG_NAMES.get(_LANG, _LANG)  # si no está listado, pasa el código tal cual
 
-# 3. Inicializar cliente ignorando proxies corruptos del sistema
+# 3. Cliente HTTP directo con httpx (streaming SSE); ya no se usa el SDK de openai.
 # La API key DEBE proporcionarse vía NVIDIA_API_KEY; no se embebe ningún valor.
 _API_KEY = os.getenv("NVIDIA_API_KEY")
 if not _API_KEY:
     print("❌ Error: define la variable de entorno NVIDIA_API_KEY antes de ejecutar el script.")
-    print("   Ejemplo: export NVIDIA_API_KEY=\"nvapi-...\"")
+    print('   Ejemplo: export NVIDIA_API_KEY="nvapi-..."')
     sys.exit(1)
-from openai import OpenAI  # import diferido: -c/-h/-V arrancan sin cargar el SDK
 # connect acotado para fallar rápido; read = límite sin recibir ningún dato del stream.
+# trust_env=False ignora proxies corruptos del sistema (típico en Debian).
 _HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=_TIMEOUT, write=30.0, pool=10.0)
-client = OpenAI(
-    base_url=_BASE_URL,
-    api_key=_API_KEY,
-    timeout=_HTTP_TIMEOUT,
-    max_retries=1,  # el default (2) reintentaría timeouts y multiplicaría la espera
-    # trust_env ignora proxies corruptos del sistema (típico en Debian).
-    http_client=httpx.Client(trust_env=False, timeout=_HTTP_TIMEOUT),
-)
+
+# Aviso temprano: el modelo activo figura en lista negra (falló antes).
+if _MODEL in _cargar_blacklist():
+    print(f"⚠️  Tu modelo activo {_MODEL} está en la lista negra (falló antes).")
+    print("   Se intentará igualmente; si falla, git ai saltará a un modelo verificado.\n")
 
 SYSTEM_PROMPT = (
     "Eres un ingeniero de software experto. Tu tarea es escribir un mensaje de commit de Git "
@@ -349,40 +386,92 @@ SYSTEM_PROMPT = (
     f"Escribe todo el mensaje en {_LANG_NAME}. Responde ÚNICAMENTE con el mensaje del commit, sin bloques de código de markdown (```), sin introducciones ni saludos."
 )
 
-def generar_commit(diff_text: str) -> str:
-    """Llama a la API y devuelve el mensaje del commit (streaming por stdout)."""
+class _ErrorModelo(Exception):
+    """Fallo invocando un modelo: 404 de cuenta, timeout, red, etc."""
+    def __init__(self, modelo: str, codigo: int, detalle: str = ""):
+        self.modelo, self.codigo, self.detalle = modelo, codigo, detalle
+        super().__init__(f"HTTP {codigo} {detalle}".strip() if detalle else f"HTTP {codigo}")
+
+def generar_commit(diff_text: str, modelo: str) -> str:
+    """Llama a la API (SSE con httpx) y devuelve el mensaje del commit, en streaming."""
     print(f"{_GREEN_COLOR}--- MENSAJE PROPUESTO ---{_RESET_COLOR}")
     _inicio = time.monotonic()
-    completion = client.chat.completions.create(
-        model=_MODEL,
-        messages=[
+    payload = {
+        "model": modelo,
+        "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Aquí está el git diff:\n{diff_text}"}
+            {"role": "user", "content": f"Aquí está el git diff:\n{diff_text}"},
         ],
-        temperature=0.2,
-        top_p=1,
-        max_tokens=2048,
-        seed=42,
-        stream=True
-    )
-
+        "temperature": 0.2,
+        "top_p": 1,
+        "max_tokens": 2048,
+        "seed": 42,
+        "stream": True,
+    }
+    headers = {
+        "Authorization": f"Bearer {_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+    }
     commit_message = ""
-    for chunk in completion:
-        if time.monotonic() - _inicio > _TIMEOUT:
-            raise TimeoutError(
-                f"Se superó el límite de {_TIMEOUT:.0f} s generando el mensaje con {_MODEL}.\n"
-                "   Opciones: export GIT_AI_TIMEOUT=120 (dar más tiempo) o elegir un modelo más rápido con 'git ai -c'."
-            )
-        if not getattr(chunk, "choices", None): continue
-        if len(chunk.choices) == 0 or getattr(chunk.choices[0], "delta", None) is None: continue
-        delta = chunk.choices[0].delta
-        if getattr(delta, "content", None) is not None:
-            content = delta.content
-            print(content, end="", flush=True)
-            commit_message += content
-
+    try:
+        with httpx.Client(trust_env=False, timeout=_HTTP_TIMEOUT) as http:
+            with http.stream("POST", f"{_BASE_URL}/chat/completions", headers=headers, json=payload) as resp:
+                if resp.status_code != 200:
+                    cuerpo = resp.read().decode("utf-8", "replace")
+                    try:
+                        detalle = str(json.loads(cuerpo).get("detail", cuerpo[:200]))
+                    except ValueError:
+                        detalle = cuerpo[:200]
+                    raise _ErrorModelo(modelo, resp.status_code, detalle)
+                for line in resp.iter_lines():
+                    if time.monotonic() - _inicio > _TIMEOUT:
+                        raise _ErrorModelo(
+                            modelo, 0, f"timeout: más de {_TIMEOUT:.0f} s generando el mensaje"
+                        )
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data)
+                    except ValueError:
+                        continue
+                    choices = obj.get("choices") or []
+                    if not choices:
+                        continue
+                    content = (choices[0].get("delta") or {}).get("content")
+                    if content:
+                        print(content, end="", flush=True)
+                        commit_message += content
+    except httpx.TimeoutException as e:
+        raise _ErrorModelo(modelo, 0, f"timeout: {e.__class__.__name__}") from e
+    except httpx.RequestError as e:
+        raise _ErrorModelo(modelo, 0, f"red: {e}") from e
     print(f"\n{_GREEN_COLOR}------------------------{_RESET_COLOR}\n")
     return commit_message
+
+def _generar_con_fallback(diff_text: str):
+    """Genera el mensaje; si el modelo falla (404/timeout/red) prueba los verificados en caché.
+
+    Devuelve (mensaje, modelo_usado). El modelo que funciona se persiste luego
+    como activo, y los 404 van solos a la lista negra.
+    """
+    activo, fallados = _MODEL, set()
+    while True:
+        try:
+            return generar_commit(diff_text, activo), activo
+        except _ErrorModelo as fallo:
+            fallados.add(fallo.modelo)
+            if "not found for account" in fallo.detalle.lower():
+                _guardar_blacklist(_cargar_blacklist() | {fallo.modelo})
+                print(f"   ({fallo.modelo} añadido a lista negra)")
+            alternativas = [m for m in _modelos_verificados() if m not in fallados]
+            if not alternativas:
+                raise
+            print(f"\n⚠️  {fallo.modelo} falló ({fallo}); probando con {alternativas[0]}...")
+            activo = alternativas[0]
 
 def editar_commit(mensaje: str) -> str:
     """Abre $EDITOR (o nano/vim) para que el usuario edite el mensaje."""
@@ -406,8 +495,32 @@ def editar_commit(mensaje: str) -> str:
             pass
 
 try:
+    # 4. Cortafuegos de secretos: nada de keys al diff sin que el usuario sepa.
+    hallazgos = _buscar_secretos(diff_text)
+    if hallazgos:
+        print("🚨 Posibles secretos en el diff (no se envían silenciosamente a la nube):")
+        for tipo, ubi in hallazgos[:10]:
+            print(f"   - {tipo} en {ubi}")
+        if len(hallazgos) > 10:
+            print(f"   ... y {len(hallazgos) - 10} más")
+        if _AUTO_YES:
+            print("❌ El modo --yes aborta ante posibles secretos; revísalos y commitea a mano.")
+            sys.exit(1)
+        try:
+            _resp = input("¿Enviar el diff a la IA de todos modos? (s/N): ").strip().lower()
+        except EOFError:
+            _resp = "n"
+        if _resp not in ("s", "si", "sí"):
+            print("❌ Cancelado. Limpia los secretos del stage y vuelve a intentar.")
+            sys.exit(1)
+
     print(f"🤖 Analizando cambios con {_MODEL}...\n")
-    commit_message = generar_commit(diff_text)
+    commit_message, modelo_usado = _generar_con_fallback(diff_text)
+    if modelo_usado != _MODEL:
+        _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        _CONFIG_FILE.write_text(f'COMMIT_IA_MODEL="{modelo_usado}"\n', encoding="utf-8")
+        print(f"✔ Modelo activo actualizado a {modelo_usado} (guardado en {_CONFIG_FILE})\n")
+        _MODEL = modelo_usado
 
     if _AUTO_YES:
         # Modo --yes: confirmar automáticamente sin preguntar.
@@ -439,22 +552,24 @@ try:
                 # Tras editar, volvemos a preguntar (loop).
             elif confirm == 'r':
                 print("\n♻️  Regenerando mensaje...\n")
-                commit_message = generar_commit(diff_text)
+                commit_message, modelo_usado = _generar_con_fallback(diff_text)
+                if modelo_usado != _MODEL:
+                    _MODEL = modelo_usado
+                    _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                    _CONFIG_FILE.write_text(f'COMMIT_IA_MODEL="{modelo_usado}"\n', encoding="utf-8")
+                    print(f"✔ Modelo activo actualizado a {modelo_usado}\n")
             else:
                 print("\n❌ Commit cancelado.")
                 break
-except TimeoutError as e:
-    print(f"\n⏱️ {e}")
+except _ErrorModelo as e:
+    print(f"\n❌ Ningún modelo pudo generar el mensaje. Último fallo: {e}")
+    if "timeout" in str(e).lower():
+        print("   Sube el límite: export GIT_AI_TIMEOUT=120")
+    print("   Revisa los disponibles con: git ai -c")
+    sys.exit(1)
 except Exception as e:
-    texto = str(e).lower()
-    if "timeout" in texto or "timed out" in texto:
-        print(f"\n⏱️ La API tardó demasiado (más de {_TIMEOUT:.0f} s sin respuesta completa).")
-        print("   Sube el límite: export GIT_AI_TIMEOUT=120  |  o modelo más rápido: git ai -c")
-    elif "not found for account" in texto:
-        _guardar_blacklist(_cargar_blacklist() | {_MODEL})
-        print(f"\n❌ El modelo {_MODEL} no está disponible para tu cuenta (404).")
-        print("   Añadido a la lista negra; elige otro verificado: git ai -c")
-    else:
-        print(f"\n❌ Error de comunicación con la API: {e}")
+    print(f"\n❌ Error inesperado: {e}")
+    sys.exit(1)
 except KeyboardInterrupt:
     print("\n\n❌ Operación cancelada por el usuario.")
+    sys.exit(130)
