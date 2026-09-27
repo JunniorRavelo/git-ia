@@ -3,11 +3,11 @@ import os
 import sys
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 import httpx
-from openai import OpenAI
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 # 0. Archivo de configuración persistente (~/.config/git-ai/config.env)
 #    Se carga antes que nada: las variables de entorno ya definidas tienen prioridad
@@ -30,6 +30,11 @@ def _load_config_file():
             os.environ[key] = value
 
 _load_config_file()
+
+# Colores: se respetan NO_COLOR y la salida no interactiva (pipes/redirecciones)
+_USE_COLOR = sys.stdout.isatty() and os.getenv("NO_COLOR") is None
+_GREEN_COLOR = "\033[92m" if _USE_COLOR else ""
+_RESET_COLOR = "\033[0m" if _USE_COLOR else ""
 
 # El catálogo de modelos ya no es una lista fija: `git ai -c` lo consulta en
 # vivo al API (GET {NVIDIA_BASE_URL}/models). Como ese endpoint no informa las
@@ -61,6 +66,7 @@ def cmd_configure():
     """Consulta en vivo el catálogo del API de NVIDIA y permite elegir/guardar el activo."""
     print(f"git-ai v{__version__} — Configuración de modelo\n")
     print("Consultando el catálogo de modelos en NVIDIA build API...")
+    _t0 = time.monotonic()
     headers = {"Accept": "application/json"}
     # El endpoint /models es público; si hay API key se manda por si esto cambia.
     if os.getenv("NVIDIA_API_KEY"):
@@ -80,6 +86,7 @@ def cmd_configure():
         print(f"❌ Error de comunicación con la API: {e}")
         sys.exit(1)
 
+    print(f"✔ Catálogo recibido en {time.monotonic() - _t0:.1f} s")
     all_ids = sorted(
         str(m.get("id", "")) for m in catalog.get("data", []) if m.get("id")
     )
@@ -93,8 +100,10 @@ def cmd_configure():
         " se excluyen embeddings, visión, safety, reward, parsing, riva, etc.):\n"
     )
     for i, mid in enumerate(models, 1):
-        marker = "  (actual)" if mid == _MODEL else ""
-        print(f"  {i}. {mid}{marker}")
+        if mid == _MODEL:
+            print(f"{_GREEN_COLOR}  {i}. {mid}  (actual){_RESET_COLOR}")
+        else:
+            print(f"  {i}. {mid}")
     print()
     while True:
         try:
@@ -173,10 +182,6 @@ if not diff_text:
     print("❌ No hay archivos en stage. Usa 'git add' primero.")
     sys.exit(0)
 
-_USE_COLOR = sys.stdout.isatty() and os.getenv("NO_COLOR") is None
-_GREEN_COLOR = "\033[92m" if _USE_COLOR else ""
-_RESET_COLOR = "\033[0m" if _USE_COLOR else ""
-
 # 2. Mapa de códigos ISO 639-1 -> nombre del idioma (para el prompt)
 _LANG_NAMES = {
     "es": "español", "en": "English", "fr": "français", "de": "Deutsch",
@@ -193,6 +198,7 @@ if not _API_KEY:
     print("❌ Error: define la variable de entorno NVIDIA_API_KEY antes de ejecutar el script.")
     print("   Ejemplo: export NVIDIA_API_KEY=\"nvapi-...\"")
     sys.exit(1)
+from openai import OpenAI  # import diferido: -c/-h/-V arrancan sin cargar el SDK
 client = OpenAI(
     base_url=_BASE_URL,
     api_key=_API_KEY,

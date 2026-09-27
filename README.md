@@ -1,6 +1,6 @@
 # git-ai
 
-![versión](https://img.shields.io/badge/versión-v1.5.0-blue)
+![versión](https://img.shields.io/badge/versión-v1.6.0-blue)
 ![licencia](https://img.shields.io/badge/licencia-MIT-green)
 ![python](https://img.shields.io/badge/python-3.8+-yellow)
 
@@ -253,10 +253,16 @@ git ai version
 Salida esperada:
 
 ```
-git-ai v1.5.0
+git-ai v1.6.0
 ```
 
 ## Changelog
+
+### v1.6.0
+
+- **feat**: en `git ai -c`, el modelo seleccionado (actual) se muestra en verde.
+- **perf**: import diferido de la librería `openai`: `-c`, `-h` y `-V` arrancan en ~0,15 s sin cargar el SDK (antes ~0,5 s).
+- **feat**: `git ai -c` muestra la latencia de la consulta del catálogo (ej. `✔ Catálogo recibido en 0.8 s`). El endpoint no publica la latencia de generación de cada modelo; como referencia general, las variantes *flash*/*nano* son las más rápidas para generar.
 
 ### v1.5.0
 
