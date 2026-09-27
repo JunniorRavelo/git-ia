@@ -7,7 +7,7 @@ from pathlib import Path
 import httpx
 from openai import OpenAI
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 # 0. Archivo de configuración persistente (~/.config/git-ai/config.env)
 #    Se carga antes que nada: las variables de entorno ya definidas tienen prioridad
@@ -31,47 +31,26 @@ def _load_config_file():
 
 _load_config_file()
 
-# Modelos gratuitos disponibles en NVIDIA build API (verificados 2026-09-27).
-# Solo se listan modelos de chat completions (la interfaz que usa este script);
-# endpoints de otro tipo (ej. kumo-relational para datos estructurados) no aplican.
-_AVAILABLE_MODELS = [
-    {
-        "id": "deepseek-ai/deepseek-v4.1-flash",
-        "name": "DeepSeek V4.1 Flash",
-        "desc": "Multimodal (texto+imagen). Sucesor del v4-flash; el ejemplo oficial admite hasta 262144 max_tokens.",
-        "url": "https://build.nvidia.com/deepseek-ai/deepseek-v4.1-flash",
-    },
-    {
-        "id": "z-ai/glm-5.3",
-        "name": "GLM 5.3",
-        "desc": "Modelo de chat de Z.ai, sucesor de GLM-5.2 (EOL 2026-08-21).",
-        "url": "https://build.nvidia.com/z-ai/glm-5.3",
-    },
-    {
-        "id": "z-ai/glm-5.3-flash",
-        "name": "GLM 5.3 Flash",
-        "desc": "Variante flash (ligera y rápida) de GLM-5.3.",
-        "url": "https://build.nvidia.com/z-ai/glm-5.3-flash",
-    },
-    {
-        "id": "moonshotai/kimi-k3",
-        "name": "Kimi K3",
-        "desc": "Multimodal (texto+imagen) de Moonshot AI con reasoning configurable (reasoning_effort).",
-        "url": "https://build.nvidia.com/moonshotai/kimi-k3",
-    },
-    {
-        "id": "nvidia/nemotron-3.5-lightning-30b-a3b",
-        "name": "Nemotron 3.5 Lightning 30B A3B",
-        "desc": "30B MoE (3B activos) de NVIDIA con modo thinking activable (enable_thinking, reasoning_budget).",
-        "url": "https://build.nvidia.com/nvidia/nemotron-3.5-lightning-30b-a3b",
-    },
-    {
-        "id": "meta/muse-glimmer-30b",
-        "name": "Muse Glimmer 30B",
-        "desc": "29.6B multimodal (texto+imagen) con reasoning y tool-calling. 131K contexto.",
-        "url": "https://build.nvidia.com/meta/muse-glimmer-30b",
-    },
-]
+# El catálogo de modelos ya no es una lista fija: `git ai -c` lo consulta en
+# vivo al API (GET {NVIDIA_BASE_URL}/models). Como ese endpoint no informa las
+# capacidades de cada modelo, el filtro es por nombre: se excluyen las familias
+# que no generan texto por chat completions y se lista todo lo demás.
+_NON_CHAT_PATTERNS = (
+    # embeddings / recuperación
+    "embed", "rerank", "retriever", "retrieval",
+    # clasificación / puntuación / moderación
+    "reward", "guard", "safety", "calibration",
+    # multimodales no-texto (visión, audio, video, documentos)
+    "vision", "vlm", "omni", "clip", "vila", "neva", "kosmos", "fuyu",
+    "deplot", "cosmos", "diffusion",
+    # OCR / parsing / voz / traducción / detección
+    "parse", "riva", "detector",
+)
+
+def _is_text_chat_model(model_id: str) -> bool:
+    """True si el id del modelo no cae en ninguna familia no-chat."""
+    low = model_id.lower()
+    return not any(p in low for p in _NON_CHAT_PATTERNS)
 
 # Configuración desde variables de entorno (con defaults)
 _BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
@@ -79,32 +58,70 @@ _MODEL = os.getenv("COMMIT_IA_MODEL", "deepseek-ai/deepseek-v4.1-flash")
 _LANG = os.getenv("COMMIT_IA_LANG", "es")
 
 def cmd_configure():
-    """Muestra los modelos gratuitos disponibles y permite elegir/guardar el activo."""
+    """Consulta en vivo el catálogo del API de NVIDIA y permite elegir/guardar el activo."""
     print(f"git-ai v{__version__} — Configuración de modelo\n")
-    print("Modelos gratuitos disponibles en NVIDIA build API:\n")
-    for i, m in enumerate(_AVAILABLE_MODELS, 1):
-        marker = "  (actual)" if m["id"] == _MODEL else ""
-        print(f"  {i}. {m['name']}{marker}")
-        print(f"     id:   {m['id']}")
-        print(f"     {m['desc']}")
-        print(f"     {m['url']}\n")
+    print("Consultando el catálogo de modelos en NVIDIA build API...")
+    headers = {"Accept": "application/json"}
+    # El endpoint /models es público; si hay API key se manda por si esto cambia.
+    if os.getenv("NVIDIA_API_KEY"):
+        headers["Authorization"] = f"Bearer {os.environ['NVIDIA_API_KEY']}"
+    try:
+        with httpx.Client(trust_env=False, timeout=30) as http:
+            resp = http.get(f"{_BASE_URL}/models", headers=headers)
+            resp.raise_for_status()
+            catalog = resp.json()
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code in (401, 403):
+            print(f"❌ Error: la API rechazó tu NVIDIA_API_KEY (HTTP {e.response.status_code}).")
+        else:
+            print(f"❌ Error HTTP {e.response.status_code} al consultar el catálogo.")
+        sys.exit(1)
+    except (httpx.RequestError, ValueError) as e:
+        print(f"❌ Error de comunicación con la API: {e}")
+        sys.exit(1)
+
+    all_ids = sorted(
+        str(m.get("id", "")) for m in catalog.get("data", []) if m.get("id")
+    )
+    models = [mid for mid in all_ids if _is_text_chat_model(mid)]
+    if not models:
+        print("❌ El catálogo no devolvió modelos compatibles con chat de texto.")
+        sys.exit(1)
+
+    print(
+        f"\nModelos de chat de texto disponibles ({len(models)} de {len(all_ids)};"
+        " se excluyen embeddings, visión, safety, reward, parsing, riva, etc.):\n"
+    )
+    for i, mid in enumerate(models, 1):
+        marker = "  (actual)" if mid == _MODEL else ""
+        print(f"  {i}. {mid}{marker}")
+    print()
     while True:
-        sel = input("Selecciona un modelo por número (o 'q' para salir sin guardar): ").strip().lower()
-        if sel in ("q", "quit", "exit", ""):
+        try:
+            sel = input("Selecciona un modelo por número o id (o 'q' para salir sin guardar): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nNo se guardaron cambios.")
+            sys.exit(0)
+        if sel.lower() in ("q", "quit", "exit", ""):
             print("No se guardaron cambios.")
             sys.exit(0)
-        try:
-            chosen = _AVAILABLE_MODELS[int(sel) - 1]
-        except (ValueError, IndexError):
+        chosen = None
+        if sel.isdigit():
+            idx = int(sel) - 1
+            if 0 <= idx < len(models):
+                chosen = models[idx]
+        elif sel in models:
+            chosen = sel
+        if chosen is None:
             print("❌ Selección inválida. Intenta de nuevo.")
             continue
         break
     _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    _CONFIG_FILE.write_text(f'COMMIT_IA_MODEL="{chosen["id"]}"\n', encoding="utf-8")
+    _CONFIG_FILE.write_text(f'COMMIT_IA_MODEL="{chosen}"\n', encoding="utf-8")
     print(f"\n✔ Modelo guardado en {_CONFIG_FILE}")
-    print(f'  COMMIT_IA_MODEL="{chosen["id"]}"')
+    print(f'  COMMIT_IA_MODEL="{chosen}"')
     print("\nPara usarlo manualmente (ej. en ~/.bashrc), añade:")
-    print(f'  export COMMIT_IA_MODEL="{chosen["id"]}"')
+    print(f'  export COMMIT_IA_MODEL="{chosen}"')
     print("\nNota: la variable de entorno manual tiene prioridad sobre el archivo de config.")
     sys.exit(0)
 
@@ -118,8 +135,9 @@ def cmd_help():
     print("                 un mensaje de commit siguiendo Conventional Commits.")
     print("  -y, --yes      Acepta automáticamente el mensaje propuesto y hace el commit")
     print("                 sin mostrar el prompt de confirmación.")
-    print("  -c, configure  Lista los modelos gratuitos disponibles en NVIDIA build API y")
-    print("                 elige el activo (se guarda en ~/.config/git-ai/config.env).")
+    print("  -c, configure  Consulta en vivo el catálogo del API de NVIDIA, lista solo")
+    print("                 los modelos de chat de texto y elige el activo (se guarda")
+    print("                 en ~/.config/git-ai/config.env).")
     print("  -h, --help     Muestra esta ayuda.")
     print("  -V, --version  Muestra la versión instalada.\n")
     print("Variables de entorno:")

@@ -1,6 +1,6 @@
 # git-ai
 
-![versión](https://img.shields.io/badge/versión-v1.4.0-blue)
+![versión](https://img.shields.io/badge/versión-v1.5.0-blue)
 ![licencia](https://img.shields.io/badge/licencia-MIT-green)
 ![python](https://img.shields.io/badge/python-3.8+-yellow)
 
@@ -130,27 +130,28 @@ git ai -c
 git ai configure
 ```
 
-Se muestra un listado con los modelos disponibles (verificados el 2026-09-27;
-solo se listan los compatibles con chat completions, la API que usa git-ai):
+Consulta **en vivo** el catálogo de modelos del API de NVIDIA
+(`GET https://integrate.api.nvidia.com/v1/models`), así que la lista siempre
+refleja el estado actual del catálogo (altas y bajas incluidas). La consulta
+al catálogo es pública: **no requiere API key** (generar commits sí).
 
-| # | Modelo                                    | Tipo                                                |
-|---|-------------------------------------------|-----------------------------------------------------|
-| 1 | `deepseek-ai/deepseek-v4.1-flash`         | Multimodal (texto+imagen). Sucesor del v4-flash.    |
-| 2 | `z-ai/glm-5.3`                            | Chat de Z.ai, sucesor de GLM-5.2.                   |
-| 3 | `z-ai/glm-5.3-flash`                      | Variante flash (ligera y rápida) de GLM-5.3.        |
-| 4 | `moonshotai/kimi-k3`                      | Multimodal (texto+imagen) con reasoning configurable.|
-| 5 | `nvidia/nemotron-3.5-lightning-30b-a3b`   | 30B MoE (3B activos) con modo thinking.             |
-| 6 | `meta/muse-glimmer-30b`                   | 29.6B multimodal con reasoning. 131K ctx.           |
-
-> ℹ️ Modelos retirados del catálogo y de este listado: `z-ai/glm-5.2` (EOL
-> 2026-08-21), `deepseek-ai/deepseek-v4-flash-0731`, `poolside/laguna-xs-2.1` y
-> `minimaxai/minimax-m3` (actualización del 2026-09-27). El default pasó a
-> `deepseek-ai/deepseek-v4.1-flash`.
-
-Al seleccionar uno por número, la elección se **guarda automáticamente** en
-`~/.config/git-ai/config.env` y se usa en adelante. Además se imprime el comando
-`export COMMIT_IA_MODEL=...` por si quieres replicarlo a mano en tu `~/.bashrc`
-(la variable de entorno manual tiene prioridad sobre el archivo de config).
+- Lista **solo los modelos que sirven para chat de texto**, la interfaz que usa
+  git-ai. Como el endpoint no informa capacidades, el filtro es por nombre y
+  excluye automáticamente lo que no aplica: embeddings, rerankers, visión/VLM,
+  safety/guard, reward, calibration, OCR/parsing, traducción (riva) y
+  detectores.
+- Los modelos *coding* (deepseek-coder, codestral, granite-code, codellama...)
+  **sí funcionan** para generar commits: son LLM de texto especializados en
+  código. Las variantes *instruct*/*chat* siguen bien las instrucciones; los
+  modelos *base* (starcoder2, gemma-2b, mixtral-8x22b-v0.1) pueden dar
+  resultados peores porque no están afinados a instrucciones.
+- Al seleccionar uno por número (o escribiendo su id), la elección se **guarda
+  automáticamente** en `~/.config/git-ai/config.env` y se usa en adelante.
+  Además se imprime el comando `export COMMIT_IA_MODEL=...` por si quieres
+  replicarlo a mano en tu `~/.bashrc`.
+- Si el filtro excluyera algún modelo que quieras usar, fórzalo a mano con
+  `export COMMIT_IA_MODEL="id-del-modelo"` (la variable de entorno tiene
+  prioridad sobre el archivo de config).
 
 ## Uso
 
@@ -252,10 +253,17 @@ git ai version
 Salida esperada:
 
 ```
-git-ai v1.4.0
+git-ai v1.5.0
 ```
 
 ## Changelog
+
+### v1.5.0
+
+- **feat**: `git ai -c` ahora consulta **en vivo** el catálogo de modelos del API de NVIDIA (`GET /v1/models`) en lugar de una lista fija en el código; se elimina la constante `_AVAILABLE_MODELS`.
+- **feat**: filtro automático por nombre para listar solo modelos de chat de texto: se excluyen embeddings, rerankers, visión/VLM, safety/guard, reward, calibration, OCR/parsing, traducción (riva) y detectores.
+- **feat**: la consulta del catálogo no requiere `NVIDIA_API_KEY` (el endpoint `/v1/models` es público); si la variable está definida se manda igualmente.
+- **feat**: en el menú se puede seleccionar el modelo por número o escribiendo su id exacto.
 
 ### v1.4.0
 
