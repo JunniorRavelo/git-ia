@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 import httpx
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 # 0. Archivo de configuración persistente (~/.config/git-ai/config.env)
 #    Se carga antes que nada: las variables de entorno ya definidas tienen prioridad
@@ -121,6 +121,7 @@ _CACHE_FILE = _CONFIG_DIR / "models-cache.json"
 _CACHE_TTL = 7 * 24 * 3600  # la verificación cacheada dura 7 días
 _PROBE_TIMEOUT = 20.0       # segundos máximos de respuesta por modelo en la prueba
 _BLACKLIST_FILE = _CONFIG_DIR / "blacklist.json"  # modelos caídos: no se re-testean
+_LIMITES_FILE = _CONFIG_DIR / "context-limits.json"  # límites de contexto aprendidos de errores 400
 
 def _cargar_blacklist() -> set:
     """Modelos conocidos como caídos (404/cuelgues): se omiten en cada verificación."""
@@ -172,6 +173,84 @@ def _buscar_secretos(diff_text: str) -> list:
         elif lin.startswith(" "):
             linea += 1
     return hallazgos
+
+# --- Exceso de tokens -------------------------------------------------------
+#
+# Cuando el diff no cabe en el contexto del modelo, el API responde 400 con un
+# mensaje tipo: "This model's maximum context length is 1000000 tokens.
+# However, your messages resulted in 4146683 tokens." En vez de saltar a otro
+# modelo (que casi seguro también fallará), se le explica al usuario el
+# exceso y se excluyen archivos ENTEROS del análisis hasta que el diff quepa:
+# nunca se parte ni se trunca un archivo, porque el mensaje pierde precisión.
+
+# Holgura que se reserva del límite al decidir si un diff cabe: cubre el
+# prompt del sistema (~600 tokens) y parte de la respuesta (max_tokens=2048).
+_MARGEN_TOKENS = 3_000
+
+def _cargar_limites() -> dict:
+    """Límites de contexto por modelo, aprendidos de errores 400 anteriores."""
+    try:
+        data = json.loads(_LIMITES_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, int)}
+    except (OSError, ValueError):
+        pass
+    return {}
+
+def _guardar_limite(modelo: str, limite: int) -> None:
+    if not limite:
+        return
+    limites = _cargar_limites()
+    if limites.get(modelo) == limite:
+        return
+    limites[modelo] = limite
+    _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _LIMITES_FILE.write_text(json.dumps(limites, indent=2, sort_keys=True), encoding="utf-8")
+
+def _estimar_tokens(texto: str) -> int:
+    """Aproximación por caracteres (~4 por token, típico en código y JSON)."""
+    return max(1, len(texto) // 4)
+
+def _detectar_exceso_tokens(cuerpo: str):
+    """Extrae (límite, actual) del cuerpo de un error de contexto; None si no lo es."""
+    t = cuerpo.lower()
+    pistas = ("context length", "context window", "too many tokens", "reduce the length")
+    if not any(p in t for p in pistas):
+        return None
+    limite = actual = None
+    m = re.search(r"maximum context (?:length|window) (?:is|of)?\s*(\d+)", t)
+    if m:
+        limite = int(m.group(1))
+    m = re.search(r"(?:resulted in|resulting in|messages (?:have|has|contains?)) (\d{3,}) tokens", t)
+    if m:
+        actual = int(m.group(1))
+    if limite is None and actual is None and "reduce the length" not in t:
+        return None
+    return limite, actual
+
+def _partir_diff(diff_texto: str) -> list:
+    """Divide el diff en un bloque por archivo (cortando en cada 'diff --git')."""
+    partes, actual = [], []
+    for lin in diff_texto.splitlines(keepends=True):
+        if lin.startswith("diff --git ") and actual:
+            partes.append("".join(actual))
+            actual = [lin]
+        else:
+            actual.append(lin)
+    if actual:
+        partes.append("".join(actual))
+    return partes
+
+def _nombre_de_parte(parte: str) -> str:
+    """Nombre del archivo de un bloque de diff (carpeta b/, luego a/)."""
+    for prefijo in ("+++ b/", "--- a/"):
+        for lin in parte.splitlines():
+            if lin.startswith(prefijo):
+                nombre = lin[len(prefijo):].strip('"')
+                if nombre != "/dev/null":
+                    return nombre
+    m = re.match(r"diff --git a/(?:.*?) b/(.*)", parte.split("\n", 1)[0])
+    return m.group(1).strip('"') if m else "(sin nombre)"
 
 def cmd_configure():
     """Consulta el catálogo del API, verifica qué modelos responden y permite elegir/guardar el activo."""
@@ -322,12 +401,17 @@ def cmd_help():
     print("  GIT_AI_TIMEOUT   Máx. segundos de inactividad del modelo (60). Mientras la")
     print("                   IA siga respondiendo, se espera a que termine sin cortarla.\n")
     print("Tras generar el mensaje: s=confirmar / n=cancelar / e=editar / r=regenerar.")
+    print("Si el diff no cabe en el contexto del modelo, se listan los archivos por")
+    print("peso para excluir enteros del análisis (el commit no cambia) hasta que quepa.")
     sys.exit(0)
 
 # 0. Manejo de argumentos: -h/--help ; --version/-V ; -c/configure ; -y/--yes ;
 #    --refresh (junto con -c: fuerza re-probar los modelos sin usar la caché).
 #    Se recorre argv completo para que las banderas puedan ir en cualquier orden.
 _AUTO_YES = False
+# Modelos que ya fallaron por exceso de tokens y que el usuario decidió saltar
+# (opción "probar con otro modelo"): sus 400 de contexto se tratan como fallo normal.
+_IGNORAR_EXCESO = set()
 _FORCE_REFRESH = "--refresh" in sys.argv[1:]
 for _arg in sys.argv[1:]:
     if _arg in ("-h", "--help", "help"):
@@ -398,9 +482,29 @@ class _ErrorModelo(Exception):
         else:
             super().__init__(detalle or "fallo desconocido")
 
+class _ErrorTokens(_ErrorModelo):
+    """El diff no cabe en el contexto del modelo (HTTP 400 por longitud)."""
+    def __init__(self, modelo: str, limite=None, actual=None, estimado=False):
+        self.limite, self.actual, self.estimado = limite, actual, estimado
+        trozos = []
+        if actual is not None:
+            trozos.append(f"~{actual:,} tokens en el envío")
+        if limite is not None:
+            trozos.append(f"el máximo del modelo es {limite:,}")
+        detalle = "; ".join(trozos) or "reduce la longitud del diff"
+        if estimado:
+            detalle += " (estimado antes de enviar)"
+        super().__init__(modelo, 400, detalle)
+
 def generar_commit(diff_text: str, modelo: str) -> str:
     """Llama a la API (SSE con httpx) y devuelve el mensaje del commit, en streaming."""
-    print(f"{_GREEN_COLOR}--- MENSAJE PROPUESTO ---{_RESET_COLOR}")
+    # Pre-flight: si ya se conoce el límite del modelo y el diff no cabe, ni se
+    # intenta el envío (ahorra subir diffs enormes que van a fallar seguro).
+    limite = _cargar_limites().get(modelo)
+    if limite and modelo not in _IGNORAR_EXCESO and _estimar_tokens(diff_text) + _MARGEN_TOKENS > limite:
+        _guardar_limite(modelo, limite)
+        raise _ErrorTokens(modelo, limite, _estimar_tokens(diff_text), estimado=True)
+
     payload = {
         "model": modelo,
         "messages": [
@@ -424,11 +528,15 @@ def generar_commit(diff_text: str, modelo: str) -> str:
             with http.stream("POST", f"{_BASE_URL}/chat/completions", headers=headers, json=payload) as resp:
                 if resp.status_code != 200:
                     cuerpo = resp.read().decode("utf-8", "replace")
+                    exceso = _detectar_exceso_tokens(cuerpo)
+                    if exceso is not None and modelo not in _IGNORAR_EXCESO:
+                        raise _ErrorTokens(modelo, exceso[0], exceso[1])
                     try:
                         detalle = str(json.loads(cuerpo).get("detail", cuerpo[:200]))
                     except ValueError:
                         detalle = cuerpo[:200]
                     raise _ErrorModelo(modelo, resp.status_code, detalle)
+                print(f"{_GREEN_COLOR}--- MENSAJE PROPUESTO ---{_RESET_COLOR}")
                 _ultima_actividad = time.monotonic()
                 for line in resp.iter_lines():
                     _ahora = time.monotonic()
@@ -460,6 +568,10 @@ def generar_commit(diff_text: str, modelo: str) -> str:
         ) from e
     except httpx.RequestError as e:
         raise _ErrorModelo(modelo, 0, f"red: {e}") from e
+    if not commit_message.strip():
+        # Un mensaje vacío rompería `git commit -m ''`: se trata como fallo del
+        # modelo para que el fallback pruebe con otro.
+        raise _ErrorModelo(modelo, 0, "el modelo respondió con un mensaje vacío")
     print(f"\n{_GREEN_COLOR}------------------------{_RESET_COLOR}\n")
     return commit_message
 
@@ -467,22 +579,157 @@ def _generar_con_fallback(diff_text: str):
     """Genera el mensaje; si el modelo falla (404/timeout/red) prueba los verificados en caché.
 
     Devuelve (mensaje, modelo_usado). El modelo que funciona se persiste luego
-    como activo, y los 404 van solos a la lista negra.
+    como activo, y los 404 van solos a la lista negra. Los errores de exceso
+    de tokens NO se resuelven cambiando de modelo: se elevan para que el
+    usuario excluya archivos enteros hasta que el diff quepa (salvo que haya
+    optado por saltarlos).
     """
-    activo, fallados = _MODEL, set()
+    if _MODEL in _IGNORAR_EXCESO:
+        vivos = [m for m in _modelos_verificados() if m not in _IGNORAR_EXCESO]
+        if not vivos:
+            raise _ErrorModelo(_MODEL, 0, "todos los modelos verificados ya fallaron por exceso de tokens")
+        print(f"(saltando {_MODEL}: ya falló por exceso de tokens; probando {vivos[0]})")
+        activo = vivos[0]
+    else:
+        activo = _MODEL
+    fallados = set(_IGNORAR_EXCESO)
     while True:
+        ultimo_fallo = None
         try:
             return generar_commit(diff_text, activo), activo
+        except _ErrorTokens as fallo:
+            _guardar_limite(fallo.modelo, fallo.limite)
+            if fallo.modelo not in _IGNORAR_EXCESO:
+                raise  # el exceso se decide con el usuario, no probando modelos a ciegas
+            fallados.add(fallo.modelo)
+            ultimo_fallo = fallo
         except _ErrorModelo as fallo:
             fallados.add(fallo.modelo)
             if "not found for account" in fallo.detalle.lower():
                 _guardar_blacklist(_cargar_blacklist() | {fallo.modelo})
                 print(f"   ({fallo.modelo} añadido a lista negra)")
-            alternativas = [m for m in _modelos_verificados() if m not in fallados]
-            if not alternativas:
-                raise
-            print(f"\n⚠️  {fallo.modelo} falló ({fallo}); probando con {alternativas[0]}...")
-            activo = alternativas[0]
+            ultimo_fallo = fallo
+        alternativas = [m for m in _modelos_verificados() if m not in fallados]
+        if not alternativas:
+            raise ultimo_fallo  # fuera del except no hay excepción activa: se relanza la guardada
+        print(f"\n⚠️  {ultimo_fallo.modelo} falló ({ultimo_fallo}); probando con {alternativas[0]}...")
+        activo = alternativas[0]
+
+def _resolver_exceso_tokens(fallo: _ErrorTokens, diff_texto: str):
+    """Explica que el diff supera el contexto del modelo y permite excluir
+    archivos ENTEROS del análisis hasta que quepa (nunca se parte un archivo:
+    se envía completo o no se envía, para no perder precisión).
+
+    Devuelve el diff reducido con el que reintentar, o None si el usuario
+    eligió probar otros modelos. Sale del programa si cancela.
+    """
+    partes = _partir_diff(diff_texto)
+    nombres = [_nombre_de_parte(p) for p in partes]
+    tamaños = [_estimar_tokens(p) for p in partes]
+    limite = fallo.limite
+    excluidos = set()
+    while True:
+        mantienen = [k for k in range(len(partes)) if k not in excluidos]
+        restante = sum(tamaños[k] for k in mantienen)
+
+        # Resumen del estado: completo la primera vez, incremental después.
+        if not excluidos:
+            envio = fallo.actual if fallo.actual is not None else restante
+            nota = " (estimación local, sin gastar llamada)" if fallo.estimado else ""
+            print(f"\n🚫 ¡Te pasaste de tokens! El diff no cabe en el contexto del modelo.")
+            print(f"   Envío: ~{envio:,} tokens{nota}")
+            if limite is not None:
+                print(f"   Límite de {fallo.modelo}: {limite:,} tokens")
+                if envio > limite:
+                    print(f"   Exceso: ~{envio - limite:,} tokens ({envio / limite:.1f}x el límite)")
+            else:
+                print(f"   Límite de {fallo.modelo}: desconocido (el API no informó el número)")
+        else:
+            cola = f" · límite: {limite:,} tokens" if limite is not None else ""
+            print(f"\n   Diff restante: ~{restante:,} tokens{cola}")
+        print(f"   Archivos en análisis: {len(mantienen)} de {len(partes)} · {len(diff_texto) / 1e6:.1f} MB de diff")
+
+        # ¿Ya cabe? (solo tras excluir algo: la primera vez se sabe que no)
+        if limite is not None and excluidos and restante + _MARGEN_TOKENS <= limite:
+            print(f"\n✔ Ahora cabe: ~{restante:,} ≤ {limite - _MARGEN_TOKENS:,} tokens (con margen para el prompt).")
+            print("   El commit seguirá incluyendo todo el stage; para quitar archivos del")
+            print("   commit usa 'git restore --staged <archivo>' o commitea por partes.")
+            return "".join(partes[k] for k in mantienen)
+        if limite is not None:
+            falta = restante + _MARGEN_TOKENS - limite
+            if falta > 0:
+                print(f"   ⚠️ Aún sobran ~{falta:,} tokens: excluye más archivos (prioriza los grandes).")
+            elif not excluidos:
+                print("   ⚠️ La estimación local ya cabe pero el API rechazó el envío (el tokenizador")
+                print("     real consume más de lo estimado): excluye algún archivo pesado de todos modos.")
+
+        # Lista de archivos por peso estimado (mayor primero).
+        orden = sorted(mantienen, key=lambda k: tamaños[k], reverse=True)
+        tope = min(len(orden), 30)
+        total = max(1, restante)
+        print("\nArchivos por peso estimado (mayor primero):")
+        for pos, k in enumerate(orden[:tope], 1):
+            solo_no_cabe = limite is not None and tamaños[k] + _MARGEN_TOKENS > limite
+            marca = "  ⚠️ solo ya no cabe" if solo_no_cabe else ""
+            pct = 100 * tamaños[k] / total
+            print(f"  {pos:>3}. {nombres[k][:48]:<48} ~{tamaños[k]:>10,} tokens {pct:5.1f} %{marca}")
+        if len(orden) > tope:
+            print(f"      ... y {len(orden) - tope} archivos más")
+
+        ayuda = "'1', '1 3', '2-5'"
+        if _modelos_verificados():
+            ayuda += ", m=otro modelo"
+        try:
+            sel = input(f"\nArchivos a EXCLUIR del análisis ({ayuda} / q=cancelar): ").strip()
+        except EOFError:
+            sel = "q"
+
+        if sel.lower() in ("q", "quit", "salir", "cancelar"):
+            print("\n❌ Commit cancelado: el diff supera el contexto del modelo.")
+            print("   Reduce el stage ('git restore --staged <archivo>'), commitea por partes")
+            print("   o elige un modelo con más contexto con 'git ai -c'.")
+            sys.exit(1)
+        if sel.lower() == "m":
+            if not _modelos_verificados():
+                print("❌ No hay modelos verificados en caché; ejecuta 'git ai -c' y reintenta.")
+                continue
+            _IGNORAR_EXCESO.add(fallo.modelo)
+            print(f"\n✔ Seguiremos probando otros modelos pese al exceso ({fallo.modelo} ya no se usará).")
+            return None
+
+        elegidos = set()
+        for tok in sel.split():
+            m = re.fullmatch(r"(\d+)-(\d+)", tok)
+            if m:
+                elegidos.update(range(int(m.group(1)), int(m.group(2)) + 1))
+            elif tok.isdigit():
+                elegidos.add(int(tok))
+        quitar = {orden[p - 1] for p in elegidos if 1 <= p <= tope}
+        if not quitar:
+            print("❌ No entendí la selección; indica números de la lista (ej. '1' o '1 3-5').")
+            continue
+        if len(excluidos | quitar) >= len(partes):
+            print("❌ No puedes excluir todos los archivos: no quedaría diff que analizar.")
+            print("   Si un solo archivo no cabe ni él solo (⚠️), commitealo aparte con un mensaje")
+            print("   manual o prueba un modelo con más contexto (m / 'git ai -c').")
+            continue
+        excluidos |= quitar
+        print(f"\n✔ Excluidos del análisis ({len(excluidos)}): " + ", ".join(sorted(nombres[k] for k in excluidos)))
+        print("   (el commit seguirá incluyendo estos archivos; solo la IA no los verá)")
+        if limite is None:
+            return "".join(partes[k] for k in mantienen if k not in excluidos)
+
+def _hacer_commit(mensaje: str, auto: bool = False) -> None:
+    """Ejecuta git commit mostrando su stderr si falla (hooks, identidad, etc.)."""
+    r = subprocess.run(["git", "commit", "-m", mensaje], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"\n❌ git commit falló (exit {r.returncode}):")
+        print((r.stderr or r.stdout).strip())
+        sys.exit(1)
+    sufijo = " (--yes)" if auto else ""
+    print(f"\n{_GREEN_COLOR}✔ Successfully committed!{sufijo}{_RESET_COLOR}")
+    if r.stdout.strip():
+        print(r.stdout.strip())
 
 def editar_commit(mensaje: str) -> str:
     """Abre $EDITOR (o nano/vim) para que el usuario edite el mensaje."""
@@ -525,53 +772,63 @@ try:
             print("❌ Cancelado. Limpia los secretos del stage y vuelve a intentar.")
             sys.exit(1)
 
-    print(f"🤖 Analizando cambios con {_MODEL}...\n")
-    commit_message, modelo_usado = _generar_con_fallback(diff_text)
-    if modelo_usado != _MODEL:
-        _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        _CONFIG_FILE.write_text(f'COMMIT_IA_MODEL="{modelo_usado}"\n', encoding="utf-8")
-        print(f"✔ Modelo activo actualizado a {modelo_usado} (guardado en {_CONFIG_FILE})\n")
-        _MODEL = modelo_usado
+    # 5. Generación con reintento: si el diff no cabe en el contexto del modelo,
+    #    se excluyen archivos enteros del análisis (nunca se parte un archivo)
+    #    y se reintenta con el diff reducido.
+    diff_analisis = diff_text
+    while True:
+        try:
+            print(f"🤖 Analizando cambios con {_MODEL}...\n")
+            commit_message, modelo_usado = _generar_con_fallback(diff_analisis)
+            if modelo_usado != _MODEL:
+                _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                _CONFIG_FILE.write_text(f'COMMIT_IA_MODEL="{modelo_usado}"\n', encoding="utf-8")
+                print(f"✔ Modelo activo actualizado a {modelo_usado} (guardado en {_CONFIG_FILE})\n")
+                _MODEL = modelo_usado
 
-    if _AUTO_YES:
-        # Modo --yes: confirmar automáticamente sin preguntar.
-        commit_exec = subprocess.run(
-            ["git", "commit", "-m", commit_message],
-            capture_output=True, text=True, check=True
-        )
-        print(f"{_GREEN_COLOR}✔ Successfully committed! (--yes){_RESET_COLOR}")
-        print(commit_exec.stdout)
-    else:
-        while True:
-            confirm = input(
-                "¿Quieres usar este mensaje? (s=confirmar / n=cancelar / e=editar / r=regenerar): "
-            ).strip().lower()
-
-            if confirm == 's':
-                commit_exec = subprocess.run(
-                    ["git", "commit", "-m", commit_message],
-                    capture_output=True, text=True, check=True
-                )
-                print(f"\n{_GREEN_COLOR}✔ Successfully committed!{_RESET_COLOR}")
-                print(commit_exec.stdout)
-                break
-            elif confirm == 'e':
-                commit_message = editar_commit(commit_message)
-                print(f"\n{_GREEN_COLOR}--- MENSAJE EDITADO ---{_RESET_COLOR}")
-                print(commit_message)
-                print(f"{_GREEN_COLOR}------------------------{_RESET_COLOR}\n")
-                # Tras editar, volvemos a preguntar (loop).
-            elif confirm == 'r':
-                print("\n♻️  Regenerando mensaje...\n")
-                commit_message, modelo_usado = _generar_con_fallback(diff_text)
-                if modelo_usado != _MODEL:
-                    _MODEL = modelo_usado
-                    _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-                    _CONFIG_FILE.write_text(f'COMMIT_IA_MODEL="{modelo_usado}"\n', encoding="utf-8")
-                    print(f"✔ Modelo activo actualizado a {modelo_usado}\n")
+            if _AUTO_YES:
+                # Modo --yes: confirmar automáticamente sin preguntar.
+                _hacer_commit(commit_message, auto=True)
             else:
-                print("\n❌ Commit cancelado.")
-                break
+                while True:
+                    confirm = input(
+                        "¿Quieres usar este mensaje? (s=confirmar / n=cancelar / e=editar / r=regenerar): "
+                    ).strip().lower()
+
+                    if confirm == 's':
+                        _hacer_commit(commit_message)
+                        break
+                    elif confirm == 'e':
+                        commit_message = editar_commit(commit_message)
+                        print(f"\n{_GREEN_COLOR}--- MENSAJE EDITADO ---{_RESET_COLOR}")
+                        print(commit_message)
+                        print(f"{_GREEN_COLOR}------------------------{_RESET_COLOR}\n")
+                        # Tras editar, volvemos a preguntar (loop).
+                    elif confirm == 'r':
+                        print("\n♻️  Regenerando mensaje...\n")
+                        commit_message, modelo_usado = _generar_con_fallback(diff_analisis)
+                        if modelo_usado != _MODEL:
+                            _MODEL = modelo_usado
+                            _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                            _CONFIG_FILE.write_text(f'COMMIT_IA_MODEL="{modelo_usado}"\n', encoding="utf-8")
+                            print(f"✔ Modelo activo actualizado a {modelo_usado}\n")
+                    else:
+                        print("\n❌ Commit cancelado.")
+                        break
+            break
+        except _ErrorTokens as fallo:
+            if _AUTO_YES:
+                print(f"\n❌ {fallo}")
+                print("   El diff no cabe en el contexto del modelo y el modo --yes no puede")
+                print("   preguntar. Reduce el envío antes de reintentar:")
+                print("   - quita archivos pesados del stage:  git restore --staged <archivo>")
+                print("   - o commitea por partes (git reset y git add por grupos)")
+                print("   - o elige un modelo con más contexto: git ai -c")
+                sys.exit(1)
+            reducido = _resolver_exceso_tokens(fallo, diff_analisis)
+            if reducido is not None:
+                diff_analisis = reducido
+            # con None el usuario eligió probar otros modelos: se reintenta tal cual
 except _ErrorModelo as e:
     print(f"\n❌ Ningún modelo pudo generar el mensaje. Último fallo: {e}")
     if "timeout" in str(e).lower():

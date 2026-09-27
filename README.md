@@ -1,6 +1,6 @@
 # git-ai
 
-![versión](https://img.shields.io/badge/versión-v2.1.0-blue)
+![versión](https://img.shields.io/badge/versión-v2.2.0-blue)
 ![licencia](https://img.shields.io/badge/licencia-MIT-green)
 ![python](https://img.shields.io/badge/python-3.8+-yellow)
 
@@ -268,6 +268,46 @@ La opción `r` reutiliza el mismo `git diff --cached` y vuelve a consultar a
 la IA. Útil si la primera propuesta no te convence y quieres otra redacción
 sin tener que cancelar y volver a ejecutar `git ai`.
 
+### Diff demasiado grande (límite de tokens)
+
+Si el diff no cabe en el contexto del modelo (el API responde
+`maximum context length is N tokens`), `git ai` **deja de probar modelos a
+ciegas** y va directo a la lista de exclusión: los archivos se envían
+**enteros o no se envían** — nunca se parte ni se trunca un archivo, porque
+el mensaje pierde precisión. Se excluyen archivos del *análisis* hasta que
+el diff quepa:
+
+```
+🚫 ¡Te pasaste de tokens! El diff no cabe en el contexto del modelo.
+   Envío: ~4,146,683 tokens
+   Límite de nvidia/nemotron-3-super-120b-a12b: 1,000,000 tokens
+   Exceso: ~3,146,683 tokens (4.1x el límite)
+
+Archivos por peso estimado (mayor primero):
+    1. server.js                       ~4,100,000 tokens  99.0 %  ⚠️ solo ya no cabe
+    2. lib/api.js                        ~28,500 tokens   0.7 %
+    3. lib/db.js                         ~18,200 tokens   0.4 %
+
+Archivos a EXCLUIR del análisis ('1', '1 3', '2-5', m=otro modelo / q=cancelar):
+```
+
+- Eliges por número, rango (`2-5`) o varios a la vez (`1 3 5`); la selección
+  es **acumulativa**: si tras excluir aún sobran tokens, se re-lista lo
+  restante con cuánto falta hasta que quepa.
+- El commit resultante **sigue incluyendo todo lo que está en stage**: solo
+  cambia lo que la IA ve. Para quitar archivos del commit usa
+  `git restore --staged <archivo>` o commitea por partes.
+- El aviso `⚠️ solo ya no cabe` marca los archivos que ni solos cabrían en
+  el contexto: esos hay que commitearlos aparte con mensaje manual (o
+  probar `m` para saltar a un modelo con más contexto).
+- El límite de contexto de cada modelo se **aprende y cachea** en
+  `~/.config/git-ai/context-limits.json`: si vuelves a intentarlo con un
+  diff que ya se sabe que no cabe, el aviso sale **antes de enviar nada**
+  (estimación local, sin gastar la llamada ni subir el diff).
+- En modo `git ai -y` no hay pregunta: se aborta con las soluciones
+  sugeridas (`git restore --staged`, commitear por partes o cambiar de
+  modelo) y código de salida 1.
+
 ## Seguridad
 
 - La API key se carga desde la variable de entorno `NVIDIA_API_KEY`.
@@ -293,10 +333,17 @@ git ai version
 Salida esperada:
 
 ```
-git-ai v2.1.0
+git-ai v2.2.0
 ```
 
 ## Changelog
+
+### v2.2.0
+
+- **feat**: **aviso y solución al superar el límite de tokens**: cuando el diff no cabe en el contexto del modelo (HTTP 400 `maximum context length`), en vez de saltar de modelo en modelo condenados a fallar, se muestra el exceso con números (envío, límite, múltiplo) y se va directo a la **lista de exclusión de archivos enteros** (por peso, por número/rango/múltiples, acumulativa hasta que quepa). Los archivos se envían completos o se excluyen — nunca se parten ni truncan, para no perder precisión. El commit sigue incluyendo todo el stage; también se puede saltar a otro modelo (`m`) o cancelar.
+- **feat**: los límites de contexto se aprenden de los errores 400 y se guardan en `~/.config/git-ai/context-limits.json`; si el diff ya se sabe que no cabe, el aviso sale por **estimación local antes de enviar** (sin subir el diff ni gastar la llamada). Los archivos que ni solos caben se marcan con `⚠️ solo ya no cabe`.
+- **fix**: un modelo que responde con un **mensaje vacío** ya se trata como fallo (el fallback prueba el siguiente) en lugar de romper con `git commit -m ''`.
+- **fix**: si `git commit` falla (hooks, identidad, etc.) se muestra su stderr real en lugar de `Error inesperado: Command ... non-zero exit status`.
 
 ### v2.1.0
 
