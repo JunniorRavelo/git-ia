@@ -1,6 +1,6 @@
 # git-ai
 
-![versión](https://img.shields.io/badge/versión-v1.2.0-blue)
+![versión](https://img.shields.io/badge/versión-v1.4.0-blue)
 ![licencia](https://img.shields.io/badge/licencia-MIT-green)
 ![python](https://img.shields.io/badge/python-3.8+-yellow)
 
@@ -84,7 +84,7 @@ git ai
 |--------------------|----------------------------------------------|--------------------------------------------|
 | `NVIDIA_API_KEY`   | **Obligatoria.** API key de NVIDIA.          | —                                          |
 | `NVIDIA_BASE_URL`  | URL base de la API.                          | `https://integrate.api.nvidia.com/v1`      |
-| `COMMIT_IA_MODEL`  | Modelo a usar para generar el commit.        | `deepseek-ai/deepseek-v4-flash-0731`       |
+| `COMMIT_IA_MODEL`  | Modelo a usar para generar el commit.        | `deepseek-ai/deepseek-v4.1-flash`          |
 | `COMMIT_IA_LANG`   | Idioma del mensaje de commit (código ISO 639-1). | `es`                                   |
 | `NO_COLOR`         | Si está definida, desactiva los colores.     | —                                          |
 | `GIT_AI_CONFIG_DIR`| Directorio del archivo de config persistente. | `~/.config/git-ai`                         |
@@ -130,28 +130,41 @@ git ai -c
 git ai configure
 ```
 
-Se muestra un listado con los modelos disponibles (verificados el 2026-08-21):
+Se muestra un listado con los modelos disponibles (verificados el 2026-09-27;
+solo se listan los compatibles con chat completions, la API que usa git-ai):
 
-| # | Modelo                              | Tipo                                          |
-|---|-------------------------------------|-----------------------------------------------|
-| 1 | `deepseek-ai/deepseek-v4-flash-0731` | 284B MoE (13B activos). Coding/agentic. 1M ctx. |
-| 2 | `meta/muse-glimmer-30b`             | 29.6B multimodal con reasoning. 131K ctx.      |
-| 3 | `poolside/laguna-xs-2.1`            | 33B MoE (3B activos). Agentic coding. 262K ctx.|
-| 4 | `minimaxai/minimax-m3`              | 428B MoE multimodal. Reasoning/coding. 1M ctx. |
+| # | Modelo                                    | Tipo                                                |
+|---|-------------------------------------------|-----------------------------------------------------|
+| 1 | `deepseek-ai/deepseek-v4.1-flash`         | Multimodal (texto+imagen). Sucesor del v4-flash.    |
+| 2 | `z-ai/glm-5.3`                            | Chat de Z.ai, sucesor de GLM-5.2.                   |
+| 3 | `z-ai/glm-5.3-flash`                      | Variante flash (ligera y rápida) de GLM-5.3.        |
+| 4 | `moonshotai/kimi-k3`                      | Multimodal (texto+imagen) con reasoning configurable.|
+| 5 | `nvidia/nemotron-3.5-lightning-30b-a3b`   | 30B MoE (3B activos) con modo thinking.             |
+| 6 | `meta/muse-glimmer-30b`                   | 29.6B multimodal con reasoning. 131K ctx.           |
+
+> ℹ️ Modelos retirados del catálogo y de este listado: `z-ai/glm-5.2` (EOL
+> 2026-08-21), `deepseek-ai/deepseek-v4-flash-0731`, `poolside/laguna-xs-2.1` y
+> `minimaxai/minimax-m3` (actualización del 2026-09-27). El default pasó a
+> `deepseek-ai/deepseek-v4.1-flash`.
 
 Al seleccionar uno por número, la elección se **guarda automáticamente** en
 `~/.config/git-ai/config.env` y se usa en adelante. Además se imprime el comando
 `export COMMIT_IA_MODEL=...` por si quieres replicarlo a mano en tu `~/.bashrc`
 (la variable de entorno manual tiene prioridad sobre el archivo de config).
 
-> ℹ️ `z-ai/glm-5.2` quedó fuera de servicio (EOL) el 2026-08-21 y por eso ya no
-> se incluye; el default pasó a `deepseek-ai/deepseek-v4-flash-0731`.
-
 ## Uso
 
 ```bash
 git add <archivos>
 git ai
+```
+
+Para ver la ayuda con todos los comandos y opciones disponibles en español:
+
+```bash
+git ai -h
+# o equivalentemente:
+git ai --help
 ```
 
 Para aceptar automáticamente el mensaje propuesto sin confirmación interactiva
@@ -166,7 +179,7 @@ git ai --yes
 Ejemplo de salida:
 
 ```
-🤖 Analizando cambios con deepseek-ai/deepseek-v4-flash-0731...
+🤖 Analizando cambios con deepseek-ai/deepseek-v4.1-flash...
 
 --- MENSAJE PROPUESTO ---
 feat(auth): agregar validación de token jwt
@@ -239,10 +252,20 @@ git ai version
 Salida esperada:
 
 ```
-git-ai v1.2.0
+git-ai v1.4.0
 ```
 
 ## Changelog
+
+### v1.4.0
+
+- **breaking**: actualización del catálogo de modelos de NVIDIA build API (verificados 2026-09-27). Se eliminan `deepseek-ai/deepseek-v4-flash-0731`, `poolside/laguna-xs-2.1` y `minimaxai/minimax-m3`; el default pasa a `deepseek-ai/deepseek-v4.1-flash`.
+- **feat**: nuevos modelos disponibles vía `git ai -c`: `deepseek-ai/deepseek-v4.1-flash`, `z-ai/glm-5.3`, `z-ai/glm-5.3-flash`, `moonshotai/kimi-k3` y `nvidia/nemotron-3.5-lightning-30b-a3b`. `meta/muse-glimmer-30b` se mantiene.
+- **chore**: solo se listan modelos de chat completions (la interfaz que usa git-ai); endpoints de otro tipo (ej. `kumo-relational` para predicción sobre datos estructurados) quedan fuera del listado.
+
+### v1.3.0
+
+- **feat**: bandera `git ai -h` / `git ai --help` para mostrar la ayuda con todos los comandos, opciones y variables de entorno disponibles, en español.
 
 ### v1.2.0
 

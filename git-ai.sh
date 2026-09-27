@@ -7,7 +7,7 @@ from pathlib import Path
 import httpx
 from openai import OpenAI
 
-__version__ = "1.2.0"
+__version__ = "1.4.0"
 
 # 0. Archivo de configuración persistente (~/.config/git-ai/config.env)
 #    Se carga antes que nada: las variables de entorno ya definidas tienen prioridad
@@ -31,13 +31,39 @@ def _load_config_file():
 
 _load_config_file()
 
-# Modelos gratuitos disponibles en NVIDIA build API (verificados 2026-08-21)
+# Modelos gratuitos disponibles en NVIDIA build API (verificados 2026-09-27).
+# Solo se listan modelos de chat completions (la interfaz que usa este script);
+# endpoints de otro tipo (ej. kumo-relational para datos estructurados) no aplican.
 _AVAILABLE_MODELS = [
     {
-        "id": "deepseek-ai/deepseek-v4-flash-0731",
-        "name": "DeepSeek V4 Flash 0731",
-        "desc": "284B MoE (13B activos). Optimizado para coding, chat y agentic. 1M tokens de contexto.",
-        "url": "https://build.nvidia.com/deepseek-ai/deepseek-v4-flash-0731",
+        "id": "deepseek-ai/deepseek-v4.1-flash",
+        "name": "DeepSeek V4.1 Flash",
+        "desc": "Multimodal (texto+imagen). Sucesor del v4-flash; el ejemplo oficial admite hasta 262144 max_tokens.",
+        "url": "https://build.nvidia.com/deepseek-ai/deepseek-v4.1-flash",
+    },
+    {
+        "id": "z-ai/glm-5.3",
+        "name": "GLM 5.3",
+        "desc": "Modelo de chat de Z.ai, sucesor de GLM-5.2 (EOL 2026-08-21).",
+        "url": "https://build.nvidia.com/z-ai/glm-5.3",
+    },
+    {
+        "id": "z-ai/glm-5.3-flash",
+        "name": "GLM 5.3 Flash",
+        "desc": "Variante flash (ligera y rápida) de GLM-5.3.",
+        "url": "https://build.nvidia.com/z-ai/glm-5.3-flash",
+    },
+    {
+        "id": "moonshotai/kimi-k3",
+        "name": "Kimi K3",
+        "desc": "Multimodal (texto+imagen) de Moonshot AI con reasoning configurable (reasoning_effort).",
+        "url": "https://build.nvidia.com/moonshotai/kimi-k3",
+    },
+    {
+        "id": "nvidia/nemotron-3.5-lightning-30b-a3b",
+        "name": "Nemotron 3.5 Lightning 30B A3B",
+        "desc": "30B MoE (3B activos) de NVIDIA con modo thinking activable (enable_thinking, reasoning_budget).",
+        "url": "https://build.nvidia.com/nvidia/nemotron-3.5-lightning-30b-a3b",
     },
     {
         "id": "meta/muse-glimmer-30b",
@@ -45,23 +71,11 @@ _AVAILABLE_MODELS = [
         "desc": "29.6B multimodal (texto+imagen) con reasoning y tool-calling. 131K contexto.",
         "url": "https://build.nvidia.com/meta/muse-glimmer-30b",
     },
-    {
-        "id": "poolside/laguna-xs-2.1",
-        "name": "Laguna XS 2.1",
-        "desc": "33B MoE (3B activos). Agentic coding y tareas de terminal. 262K contexto.",
-        "url": "https://build.nvidia.com/poolside/laguna-xs-2.1",
-    },
-    {
-        "id": "minimaxai/minimax-m3",
-        "name": "MiniMax M3",
-        "desc": "428B MoE multimodal (texto/imagen/video). Reasoning, coding y tool-calling. 1M contexto.",
-        "url": "https://build.nvidia.com/minimaxai/minimax-m3",
-    },
 ]
 
 # Configuración desde variables de entorno (con defaults)
 _BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
-_MODEL = os.getenv("COMMIT_IA_MODEL", "deepseek-ai/deepseek-v4-flash-0731")
+_MODEL = os.getenv("COMMIT_IA_MODEL", "deepseek-ai/deepseek-v4.1-flash")
 _LANG = os.getenv("COMMIT_IA_LANG", "es")
 
 def cmd_configure():
@@ -94,10 +108,33 @@ def cmd_configure():
     print("\nNota: la variable de entorno manual tiene prioridad sobre el archivo de config.")
     sys.exit(0)
 
-# 0. Manejo de argumentos: --version / -V / version ; -c / configure ; -y / --yes
+def cmd_help():
+    """Muestra la ayuda con los comandos y opciones disponibles."""
+    print(f"git-ai v{__version__} — Genera mensajes de commit con IA (API de NVIDIA build)\n")
+    print("Uso: git ai [opción]")
+    print("     git-ai [opción]\n")
+    print("Opciones:")
+    print("  (sin opción)   Analiza los cambios en stage (git diff --cached) y propone")
+    print("                 un mensaje de commit siguiendo Conventional Commits.")
+    print("  -y, --yes      Acepta automáticamente el mensaje propuesto y hace el commit")
+    print("                 sin mostrar el prompt de confirmación.")
+    print("  -c, configure  Lista los modelos gratuitos disponibles en NVIDIA build API y")
+    print("                 elige el activo (se guarda en ~/.config/git-ai/config.env).")
+    print("  -h, --help     Muestra esta ayuda.")
+    print("  -V, --version  Muestra la versión instalada.\n")
+    print("Variables de entorno:")
+    print("  NVIDIA_API_KEY   (obligatoria) Tu API key de NVIDIA (https://build.nvidia.com).")
+    print("  COMMIT_IA_MODEL  Modelo a usar (por defecto: deepseek-ai/deepseek-v4.1-flash).")
+    print("  COMMIT_IA_LANG   Idioma del mensaje del commit, código ISO 639-1 (por defecto: es).\n")
+    print("Tras generar el mensaje: s=confirmar / n=cancelar / e=editar / r=regenerar.")
+    sys.exit(0)
+
+# 0. Manejo de argumentos: -h/--help ; --version/-V ; -c/configure ; -y/--yes
 #    Se recorre argv completo para que las banderas puedan ir en cualquier orden.
 _AUTO_YES = False
 for _arg in sys.argv[1:]:
+    if _arg in ("-h", "--help", "help"):
+        cmd_help()
     if _arg in ("--version", "-V", "version"):
         print(f"git-ai v{__version__}")
         sys.exit(0)
