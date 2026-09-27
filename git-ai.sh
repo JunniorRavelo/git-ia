@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 import httpx
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 # 0. Archivo de configuración persistente (~/.config/git-ai/config.env)
 #    Se carga antes que nada: las variables de entorno ya definidas tienen prioridad
@@ -61,6 +61,14 @@ def _is_text_chat_model(model_id: str) -> bool:
 _BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
 _MODEL = os.getenv("COMMIT_IA_MODEL", "deepseek-ai/deepseek-v4.1-flash")
 _LANG = os.getenv("COMMIT_IA_LANG", "es")
+
+# Límite de tiempo (segundos) para generar el mensaje; evita esperas infinitas
+try:
+    _TIMEOUT = float(os.getenv("GIT_AI_TIMEOUT", "60"))
+    if _TIMEOUT <= 0:
+        raise ValueError
+except ValueError:
+    _TIMEOUT = 60.0
 
 def cmd_configure():
     """Consulta en vivo el catálogo del API de NVIDIA y permite elegir/guardar el activo."""
@@ -152,7 +160,9 @@ def cmd_help():
     print("Variables de entorno:")
     print("  NVIDIA_API_KEY   (obligatoria) Tu API key de NVIDIA (https://build.nvidia.com).")
     print("  COMMIT_IA_MODEL  Modelo a usar (por defecto: deepseek-ai/deepseek-v4.1-flash).")
-    print("  COMMIT_IA_LANG   Idioma del mensaje del commit, código ISO 639-1 (por defecto: es).\n")
+    print("  COMMIT_IA_LANG   Idioma del mensaje del commit, código ISO 639-1 (por defecto: es).")
+    print("  GIT_AI_TIMEOUT   Límite de tiempo en segundos para generar el mensaje (60).")
+    print("                   Si se agota, se cancela y sugiere cómo proceder.\n")
     print("Tras generar el mensaje: s=confirmar / n=cancelar / e=editar / r=regenerar.")
     sys.exit(0)
 
@@ -199,10 +209,15 @@ if not _API_KEY:
     print("   Ejemplo: export NVIDIA_API_KEY=\"nvapi-...\"")
     sys.exit(1)
 from openai import OpenAI  # import diferido: -c/-h/-V arrancan sin cargar el SDK
+# connect acotado para fallar rápido; read = límite sin recibir ningún dato del stream.
+_HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=_TIMEOUT, write=30.0, pool=10.0)
 client = OpenAI(
     base_url=_BASE_URL,
     api_key=_API_KEY,
-    http_client=httpx.Client(trust_env=False)  # 🔥 Esto ignora proxies mal configurados en Debian
+    timeout=_HTTP_TIMEOUT,
+    max_retries=1,  # el default (2) reintentaría timeouts y multiplicaría la espera
+    # trust_env ignora proxies corruptos del sistema (típico en Debian).
+    http_client=httpx.Client(trust_env=False, timeout=_HTTP_TIMEOUT),
 )
 
 SYSTEM_PROMPT = (
@@ -219,6 +234,7 @@ SYSTEM_PROMPT = (
 def generar_commit(diff_text: str) -> str:
     """Llama a la API y devuelve el mensaje del commit (streaming por stdout)."""
     print(f"{_GREEN_COLOR}--- MENSAJE PROPUESTO ---{_RESET_COLOR}")
+    _inicio = time.monotonic()
     completion = client.chat.completions.create(
         model=_MODEL,
         messages=[
@@ -234,6 +250,11 @@ def generar_commit(diff_text: str) -> str:
 
     commit_message = ""
     for chunk in completion:
+        if time.monotonic() - _inicio > _TIMEOUT:
+            raise TimeoutError(
+                f"Se superó el límite de {_TIMEOUT:.0f} s generando el mensaje con {_MODEL}.\n"
+                "   Opciones: export GIT_AI_TIMEOUT=120 (dar más tiempo) o elegir un modelo más rápido con 'git ai -c'."
+            )
         if not getattr(chunk, "choices", None): continue
         if len(chunk.choices) == 0 or getattr(chunk.choices[0], "delta", None) is None: continue
         delta = chunk.choices[0].delta
@@ -304,7 +325,13 @@ try:
             else:
                 print("\n❌ Commit cancelado.")
                 break
+except TimeoutError as e:
+    print(f"\n⏱️ {e}")
 except Exception as e:
-    print(f"\n❌ Error de comunicación con la API: {e}")
+    if "timeout" in str(e).lower() or "timed out" in str(e).lower():
+        print(f"\n⏱️ La API tardó demasiado (más de {_TIMEOUT:.0f} s sin respuesta completa).")
+        print("   Sube el límite: export GIT_AI_TIMEOUT=120  |  o modelo más rápido: git ai -c")
+    else:
+        print(f"\n❌ Error de comunicación con la API: {e}")
 except KeyboardInterrupt:
     print("\n\n❌ Operación cancelada por el usuario.")

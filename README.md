@@ -1,6 +1,6 @@
 # git-ai
 
-![versión](https://img.shields.io/badge/versión-v1.6.0-blue)
+![versión](https://img.shields.io/badge/versión-v1.7.0-blue)
 ![licencia](https://img.shields.io/badge/licencia-MIT-green)
 ![python](https://img.shields.io/badge/python-3.8+-yellow)
 
@@ -86,6 +86,7 @@ git ai
 | `NVIDIA_BASE_URL`  | URL base de la API.                          | `https://integrate.api.nvidia.com/v1`      |
 | `COMMIT_IA_MODEL`  | Modelo a usar para generar el commit.        | `deepseek-ai/deepseek-v4.1-flash`          |
 | `COMMIT_IA_LANG`   | Idioma del mensaje de commit (código ISO 639-1). | `es`                                   |
+| `GIT_AI_TIMEOUT`   | Límite de tiempo (segundos) para generar el mensaje; al agotarse se cancela con sugerencias. | `60`                                   |
 | `NO_COLOR`         | Si está definida, desactiva los colores.     | —                                          |
 | `GIT_AI_CONFIG_DIR`| Directorio del archivo de config persistente. | `~/.config/git-ai`                         |
 
@@ -253,10 +254,15 @@ git ai version
 Salida esperada:
 
 ```
-git-ai v1.6.0
+git-ai v1.7.0
 ```
 
 ## Changelog
+
+### v1.7.0
+
+- **feat**: límite de tiempo para generar el mensaje, configurable con `GIT_AI_TIMEOUT` (segundos, por defecto `60`). Al agotarse, la generación se cancela y se sugiere subir el límite o elegir un modelo más rápido (`git ai -c`).
+- **fix**: timeouts acotados en el cliente HTTP (conexión: 10 s; lectura: `GIT_AI_TIMEOUT` sin recibir ningún dato) y reintentos reducidos a 1, para no quedarse colgado indefinidamente si la API se cuelga.
 
 ### v1.6.0
 
