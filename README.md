@@ -1,6 +1,6 @@
 # git-ai
 
-![versión](https://img.shields.io/badge/versión-v1.7.0-blue)
+![versión](https://img.shields.io/badge/versión-v1.9.0-blue)
 ![licencia](https://img.shields.io/badge/licencia-MIT-green)
 ![python](https://img.shields.io/badge/python-3.8+-yellow)
 
@@ -132,10 +132,26 @@ git ai configure
 ```
 
 Consulta **en vivo** el catálogo de modelos del API de NVIDIA
-(`GET https://integrate.api.nvidia.com/v1/models`), así que la lista siempre
-refleja el estado actual del catálogo (altas y bajas incluidas). La consulta
-al catálogo es pública: **no requiere API key** (generar commits sí).
+(`GET https://integrate.api.nvidia.com/v1/models`) y, si tienes
+`NVIDIA_API_KEY` exportada, **prueba cada modelo con una petición mínima**
+para listar solo los que de verdad responden: el catálogo lista de más y
+varios modelos devuelven `404 "Not found for account"` al invocarlos
+(p. ej. `meta/llama2-70b`, `nvidia/nemotron-4-340b-instruct`,
+`deepseek-ai/deepseek-coder-6.7b-instruct`).
 
+- **Verificación con lista negra**: al verificar solo se prueban los modelos
+  que no están en la lista negra (`~/.config/git-ai/blacklist.json`); los
+  caídos (404 o cuelgues) se añaden ahí y **ya no se vuelven a testear**. Los
+  modelos nuevos que aparezcan en el catálogo se prueban automáticamente al
+  aparecer. El resultado vigente se cachea en
+  `~/.config/git-ai/models-cache.json` (dura 7 días) para que `git ai -c` sea
+  instantáneo; `git ai -c --refresh` fuerza re-verificar (solo vivos y
+  nuevos). Para re-testear todo, borra `blacklist.json`.
+- **Auto-blacklist**: si al generar un commit el modelo configurado responde
+  404 (no disponible para tu cuenta), se añade solo a la lista negra y se te
+  pide elegir otro.
+- Sin `NVIDIA_API_KEY` la lista se muestra **sin verificar** (solo filtro por
+  nombre): puede incluir modelos caídos que darán 404 al generar.
 - Lista **solo los modelos que sirven para chat de texto**, la interfaz que usa
   git-ai. Como el endpoint no informa capacidades, el filtro es por nombre y
   excluye automáticamente lo que no aplica: embeddings, rerankers, visión/VLM,
@@ -254,10 +270,22 @@ git ai version
 Salida esperada:
 
 ```
-git-ai v1.7.0
+git-ai v1.9.0
 ```
 
 ## Changelog
+
+### v1.9.0
+
+- **feat**: lista negra persistente (`~/.config/git-ai/blacklist.json`): los modelos caídos (404/cuelgues) se guardan y **ya no se vuelven a testear**; en cada verificación solo se prueban los vivos y los modelos nuevos que aparezcan en el catálogo. Objetivo: automatizar y ahorrar el máximo tiempo.
+- **feat**: auto-blacklist al generar: si el modelo configurado responde 404 al crear un commit, se añade solo a la lista negra.
+- **fix**: el mensaje de verificación muestra cuántos candidatos se omiten por estar en lista negra.
+
+### v1.8.0
+
+- **feat**: `git ai -c` ahora **verifica de verdad** cada modelo con una petición mínima en paralelo y solo lista los que responden: el catálogo `/v1/models` lista de más y varios modelos devuelven `404 "Not found for account"` al generar (p. ej. `meta/llama2-70b`, `nvidia/nemotron-4-340b-instruct`, `microsoft/phi-3.5-moe-instruct`).
+- **feat**: caché local de la verificación en `~/.config/git-ai/models-cache.json` (dura 7 días) para que `-c` sea instantáneo; `git ai -c --refresh` fuerza re-probar.
+- **fix**: al generar un commit, si el modelo responde 404 (no disponible para la cuenta) se muestra un mensaje claro que invita a elegir otro verificado, en lugar del error crudo.
 
 ### v1.7.0
 

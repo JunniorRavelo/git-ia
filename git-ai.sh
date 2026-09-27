@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 import os
 import sys
+import json
 import subprocess
 import tempfile
 import time
 from pathlib import Path
 import httpx
 
-__version__ = "1.7.0"
+__version__ = "1.9.0"
 
 # 0. Archivo de configuración persistente (~/.config/git-ai/config.env)
 #    Se carga antes que nada: las variables de entorno ya definidas tienen prioridad
@@ -57,6 +58,46 @@ def _is_text_chat_model(model_id: str) -> bool:
     low = model_id.lower()
     return not any(p in low for p in _NON_CHAT_PATTERNS)
 
+def _probe_models(model_ids: list) -> list:
+    """Prueba cada modelo con una petición mínima; devuelve los que responden 200.
+
+    El catálogo lista modelos que luego dan 404 al invocarlos; esta prueba
+    descarta esos (y los que cuelgan sin generar nada) antes de mostrarlos.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _probar(mid: str):
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        if os.getenv("NVIDIA_API_KEY"):
+            headers["Authorization"] = f"Bearer {os.environ['NVIDIA_API_KEY']}"
+        try:
+            with httpx.Client(
+                trust_env=False,
+                timeout=httpx.Timeout(connect=10.0, read=_PROBE_TIMEOUT, write=10.0, pool=10.0),
+            ) as http:
+                r = http.post(
+                    f"{_BASE_URL}/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": mid,
+                        "messages": [{"role": "user", "content": "ok"}],
+                        "max_tokens": 1,
+                        "stream": False,
+                    },
+                )
+            return mid if r.status_code == 200 else None
+        except Exception:
+            return None
+
+    vivos, total = [], len(model_ids)
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        for hecho, resultado in enumerate(ex.map(_probar, model_ids), 1):
+            if resultado:
+                vivos.append(resultado)
+            print(f"\r  probando {hecho}/{total}... {len(vivos)} OK", end="", flush=True)
+    print()
+    return sorted(vivos)
+
 # Configuración desde variables de entorno (con defaults)
 _BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
 _MODEL = os.getenv("COMMIT_IA_MODEL", "deepseek-ai/deepseek-v4.1-flash")
@@ -70,9 +111,43 @@ try:
 except ValueError:
     _TIMEOUT = 60.0
 
+# Verificación de modelos: el catálogo /models lista más de lo que se puede
+# invocar (los caídos dan 404 "Not found for account" al usarlos), así que
+# `git ai -c` prueba cada candidato de verdad y cachea el resultado.
+_CACHE_FILE = _CONFIG_DIR / "models-cache.json"
+_CACHE_TTL = 7 * 24 * 3600  # la verificación cacheada dura 7 días
+_PROBE_TIMEOUT = 20.0       # segundos máximos de respuesta por modelo en la prueba
+_BLACKLIST_FILE = _CONFIG_DIR / "blacklist.json"  # modelos caídos: no se re-testean
+
+def _cargar_blacklist() -> set:
+    """Modelos conocidos como caídos (404/cuelgues): se omiten en cada verificación."""
+    try:
+        data = json.loads(_BLACKLIST_FILE.read_text(encoding="utf-8"))
+        return set(data) if isinstance(data, list) else set()
+    except (OSError, ValueError):
+        return set()
+
+def _guardar_blacklist(blacklist: set) -> None:
+    _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _BLACKLIST_FILE.write_text(json.dumps(sorted(blacklist)), encoding="utf-8")
+
 def cmd_configure():
-    """Consulta en vivo el catálogo del API de NVIDIA y permite elegir/guardar el activo."""
+    """Consulta el catálogo del API, verifica qué modelos responden y permite elegir/guardar el activo."""
     print(f"git-ai v{__version__} — Configuración de modelo\n")
+
+    # 1) Caché de la última verificación (salvo que se pida --refresh)
+    if not _FORCE_REFRESH:
+        try:
+            data = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
+            edad = time.time() - float(data.get("checked", 0))
+            if data.get("models") and edad < _CACHE_TTL:
+                print(f"✔ Lista verificada hace {edad / 3600:.1f} h (caché: {_CACHE_FILE}).")
+                print("   Usa 'git ai -c --refresh' para volver a probar los modelos.")
+                return _listar_y_elegir(data["models"], f"{len(data['models'])} verificados")
+        except (OSError, ValueError, AttributeError):
+            pass  # sin caché o corrupta → camino en vivo
+
+    # 2) Catálogo en vivo
     print("Consultando el catálogo de modelos en NVIDIA build API...")
     _t0 = time.monotonic()
     headers = {"Accept": "application/json"}
@@ -98,13 +173,52 @@ def cmd_configure():
     all_ids = sorted(
         str(m.get("id", "")) for m in catalog.get("data", []) if m.get("id")
     )
-    models = [mid for mid in all_ids if _is_text_chat_model(mid)]
-    if not models:
+    candidatos = [mid for mid in all_ids if _is_text_chat_model(mid)]
+    if not candidatos:
         print("❌ El catálogo no devolvió modelos compatibles con chat de texto.")
         sys.exit(1)
 
+    # 3) Verificación real: el catálogo lista de más y varios modelos dan 404
+    #    "Not found for account" al invocarlos (o cuelgan sin generar nada).
+    #    Los caídos van a lista negra y ya no se re-testean; los modelos nuevos
+    #    que aparezcan en el catálogo se prueban solos al aparecer.
+    api_key = os.getenv("NVIDIA_API_KEY")
+    if api_key:
+        blacklist = _cargar_blacklist()
+        a_probar = [m for m in candidatos if m not in blacklist]
+        omitidos = len(candidatos) - len(a_probar)
+        if a_probar:
+            detalle = f" ({omitidos} en lista negra se omiten)" if omitidos else ""
+            print(f"Probando {len(a_probar)} modelos{detalle}...")
+            models = _probe_models(a_probar)
+        else:
+            models = []
+            print(f"Los {len(candidatos)} candidatos están en lista negra; nada que probar.")
+        muertos = sorted(set(a_probar) - set(models))
+        if muertos:
+            blacklist.update(muertos)
+            _guardar_blacklist(blacklist)
+            print(f"⛔ {len(muertos)} añadidos a lista negra ({_BLACKLIST_FILE})")
+        _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        _CACHE_FILE.write_text(
+            json.dumps({"checked": time.time(), "models": models}), encoding="utf-8"
+        )
+        print(f"✔ {len(models)} de {len(candidatos)} disponibles; caché en {_CACHE_FILE}")
+        if not models:
+            print("❌ Ningún modelo disponible. Revisa tu NVIDIA_API_KEY y tu conexión.")
+            print(f"   (borra {_BLACKLIST_FILE} para re-testear todo)")
+            sys.exit(1)
+        titulo = f"{len(models)} disponibles; {len(blacklist)} en lista negra sin re-testear"
+    else:
+        models = candidatos
+        titulo = f"{len(models)} de {len(all_ids)} del catálogo; SIN verificar (define NVIDIA_API_KEY)"
+
+    return _listar_y_elegir(models, titulo)
+
+def _listar_y_elegir(models: list, titulo: str) -> None:
+    """Muestra la lista numerada (actual en verde) y guarda el modelo elegido."""
     print(
-        f"\nModelos de chat de texto disponibles ({len(models)} de {len(all_ids)};"
+        f"\nModelos disponibles ({titulo};"
         " se excluyen embeddings, visión, safety, reward, parsing, riva, etc.):\n"
     )
     for i, mid in enumerate(models, 1):
@@ -152,9 +266,11 @@ def cmd_help():
     print("                 un mensaje de commit siguiendo Conventional Commits.")
     print("  -y, --yes      Acepta automáticamente el mensaje propuesto y hace el commit")
     print("                 sin mostrar el prompt de confirmación.")
-    print("  -c, configure  Consulta en vivo el catálogo del API de NVIDIA, lista solo")
-    print("                 los modelos de chat de texto y elige el activo (se guarda")
-    print("                 en ~/.config/git-ai/config.env).")
+    print("  -c, configure  Consulta el catálogo del API de NVIDIA, prueba cada modelo")
+    print("                 de chat de texto, manda los caídos a lista negra (cachea 7")
+    print("                 días) y elige el activo (~/.config/git-ai/config.env).")
+    print("  --refresh      Junto con -c: re-verifica sin caché; la lista negra no")
+    print("                 se re-testea (solo vivos y modelos nuevos).")
     print("  -h, --help     Muestra esta ayuda.")
     print("  -V, --version  Muestra la versión instalada.\n")
     print("Variables de entorno:")
@@ -166,9 +282,11 @@ def cmd_help():
     print("Tras generar el mensaje: s=confirmar / n=cancelar / e=editar / r=regenerar.")
     sys.exit(0)
 
-# 0. Manejo de argumentos: -h/--help ; --version/-V ; -c/configure ; -y/--yes
+# 0. Manejo de argumentos: -h/--help ; --version/-V ; -c/configure ; -y/--yes ;
+#    --refresh (junto con -c: fuerza re-probar los modelos sin usar la caché).
 #    Se recorre argv completo para que las banderas puedan ir en cualquier orden.
 _AUTO_YES = False
+_FORCE_REFRESH = "--refresh" in sys.argv[1:]
 for _arg in sys.argv[1:]:
     if _arg in ("-h", "--help", "help"):
         cmd_help()
@@ -328,9 +446,14 @@ try:
 except TimeoutError as e:
     print(f"\n⏱️ {e}")
 except Exception as e:
-    if "timeout" in str(e).lower() or "timed out" in str(e).lower():
+    texto = str(e).lower()
+    if "timeout" in texto or "timed out" in texto:
         print(f"\n⏱️ La API tardó demasiado (más de {_TIMEOUT:.0f} s sin respuesta completa).")
         print("   Sube el límite: export GIT_AI_TIMEOUT=120  |  o modelo más rápido: git ai -c")
+    elif "not found for account" in texto:
+        _guardar_blacklist(_cargar_blacklist() | {_MODEL})
+        print(f"\n❌ El modelo {_MODEL} no está disponible para tu cuenta (404).")
+        print("   Añadido a la lista negra; elige otro verificado: git ai -c")
     else:
         print(f"\n❌ Error de comunicación con la API: {e}")
 except KeyboardInterrupt:
